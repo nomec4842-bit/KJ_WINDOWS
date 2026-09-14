@@ -1,4 +1,4 @@
-# KJ_SEQ
+# KJ_WINDOWS
 
 ## Building on Windows
 
