@@ -67,6 +67,10 @@ void trackSetSynthOscSustain(int trackId, int oscIndex, float value);
 float trackGetSynthOscRelease(int trackId, int oscIndex);
 void trackSetSynthOscRelease(int trackId, int oscIndex, float value);
 
+float trackGetSynthOscWavetablePosition(int trackId, int oscIndex);
+void trackSetSynthOscWavetablePosition(int trackId, int oscIndex, float value);
+float trackGetSynthOscWavetableMix(int trackId, int oscIndex);
+void trackSetSynthOscWavetableMix(int trackId, int oscIndex, float value);
 bool trackGetSynthOscWavetableEnabled(int trackId, int oscIndex);
 void trackSetSynthOscWavetableEnabled(int trackId, int oscIndex, bool enabled);
 

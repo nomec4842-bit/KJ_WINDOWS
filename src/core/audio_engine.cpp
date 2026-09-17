@@ -1,5 +1,16 @@
+#include "core/audio_input.h"
+#include "core/audio_meter.h"
+#include "core/eq_spectrum.h"
+#include "core/eq_processor.h"
 #include "core/audio_engine.h"
+#ifdef KJ_ENABLE_VST3
+#include "hosting/TrackVST3.h"
+#endif
 
+#include "core/audio_recording.h"
+#include "core/piano_pattern.h"
+#include "core/playback_snapshot.h"
+#include "core/waveform_snapshot.h"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -8,6 +19,8 @@
 #endif
 
 #include <windows.h>
+#include "core/envelope.h"
+#include "core/synth_oscillator_bank.h"
 #include <audioclient.h>
 #include <mmdeviceapi.h>
 #include <mmreg.h>
@@ -48,7 +61,11 @@
 #include "audio/thread_pool.h"
 
 std::atomic<bool> isPlaying = false;
-static std::atomic<bool> running{true};
+static std::atomic<double> vstDeviceSampleRate {44100.0};
+static std::atomic<bool> running{false};
+static std::atomic<ULONGLONG> lastOutputClip{0};
+bool isAudioOutputClipping() { auto tick=lastOutputClip.load(std::memory_order_relaxed);return tick && GetTickCount64()-tick<1000; }
+bool isAudioRunning() { return running.load(std::memory_order_relaxed); }
 static std::thread audioThread;
 static std::thread sequencerThread;
 static std::atomic<bool> audioSequencerReady{false};
@@ -59,10 +76,9 @@ struct AudioDeviceSnapshot
     std::wstring activeName;
 };
 
-static std::array<AudioDeviceSnapshot, 2> gDeviceSnapshots{};
-static std::atomic<int> gDeviceSnapshotIndex{0};
-static std::array<std::wstring, 2> gRequestedDeviceIds{};
-static std::atomic<int> gRequestedDeviceIndex{0};
+static std::mutex gDeviceStateMutex;
+static AudioDeviceSnapshot gDeviceSnapshot;
+static std::wstring gRequestedDeviceId;
 static std::atomic<bool> deviceChangeRequested{false};
 static ThreadPool& getTrackProcessingPool()
 {
@@ -73,47 +89,29 @@ static ThreadPool& getTrackProcessingPool()
     return pool;
 }
 
-static const AudioDeviceSnapshot& getDeviceSnapshot()
+// Device metadata is copied while protected; callers never retain a reference
+// into storage that a subsequent device switch can reuse.
+static AudioDeviceSnapshot getDeviceSnapshot()
 {
-    return gDeviceSnapshots[gDeviceSnapshotIndex.load(std::memory_order_acquire)];
+    std::lock_guard<std::mutex> lock(gDeviceStateMutex);
+    return gDeviceSnapshot;
 }
-
 static void publishDeviceSnapshot(const AudioDeviceSnapshot& snapshot)
 {
-    int nextIndex = gDeviceSnapshotIndex.load(std::memory_order_relaxed) ^ 1;
-    gDeviceSnapshots[nextIndex] = snapshot;
-    gDeviceSnapshotIndex.store(nextIndex, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(gDeviceStateMutex);
+    gDeviceSnapshot=snapshot;
 }
-
-constexpr std::size_t kMasterWaveformBufferSize = 44100;
-struct WaveformBuffer
-{
-    std::array<float, kMasterWaveformBufferSize> data{};
-    std::size_t count = 0;
-};
-
-static std::array<WaveformBuffer, 2> masterWaveformBuffers{};
-static std::atomic<int> masterWaveformPublishIndex{0};
-static int masterWaveformWriteIndex = 1;
+constexpr std::size_t kMasterWaveformBufferSize=44100;
+static WaveformSnapshot<kMasterWaveformBufferSize> masterWaveform;
 constexpr std::size_t kAudioNotificationCapacity = 128;
 static std::array<AudioThreadNotification, kAudioNotificationCapacity> gAudioNotificationQueue{};
 static std::atomic<std::size_t> gAudioNotificationHead{0};
 static std::atomic<std::size_t> gAudioNotificationTail{0};
 
 
-static void writeWaveformSamples(const float* samples, std::size_t sampleCount)
+static void writeWaveformSamples(const float* samples,std::size_t count)
 {
-    WaveformBuffer& buffer = masterWaveformBuffers[masterWaveformWriteIndex];
-    const std::size_t capacity = buffer.data.size();
-    if (!samples || sampleCount == 0 || capacity == 0)
-        return;
-
-    const std::size_t copyCount = std::min(sampleCount, capacity);
-    std::memcpy(buffer.data.data(), samples, sizeof(float) * copyCount);
-    buffer.count = copyCount;
-
-    masterWaveformPublishIndex.store(masterWaveformWriteIndex, std::memory_order_release);
-    masterWaveformWriteIndex ^= 1;
+    masterWaveform.publish(samples,count);
 }
 
 static void enqueueAudioThreadNotification(const std::wstring& title, const std::wstring& message)
@@ -274,7 +272,7 @@ constexpr double kCompressorAttackMin = 0.001;
 constexpr double kCompressorAttackMax = 1.0;
 constexpr double kCompressorReleaseMin = 0.01;
 constexpr double kCompressorReleaseMax = 4.0;
-constexpr size_t kModSourceCount = 6;
+constexpr size_t kModSourceCount = kLfoSourceCount;
 constexpr std::array<double, 3> kDefaultLfoFrequencies = {0.5, 1.0, 2.0};
 
 int cachedModMatrixParameterCount()
@@ -481,120 +479,15 @@ double computePitchEnvelopeStep(double sampleRate, double rangeSemitones)
     return 1.0 / (envelopeTime * sr);
 }
 
-enum class EnvelopeStage
-{
-    Idle,
-    Attack,
-    Decay,
-    Sustain,
-    Release,
-};
-
-const char* envelopeStageToString(EnvelopeStage stage)
-{
-    switch (stage)
-    {
-    case EnvelopeStage::Idle:
-        return "Idle";
-    case EnvelopeStage::Attack:
-        return "Attack";
-    case EnvelopeStage::Decay:
-        return "Decay";
-    case EnvelopeStage::Sustain:
-        return "Sustain";
-    case EnvelopeStage::Release:
-        return "Release";
-    }
-    return "Unknown";
-}
-
-double advanceEnvelope(EnvelopeStage& stage, double currentValue, double attack, double decay, double sustain,
-                       double release, double sampleRate)
-{
-    double sr = sampleRate > 0.0 ? sampleRate : 44100.0;
-    double value = currentValue;
-    double safeSustain = std::clamp(sustain, 0.0, 1.0);
-    auto advanceCurved = [&](double target, double timeSeconds) {
-        if (timeSeconds <= 0.0)
-        {
-            value = target;
-            return true;
-        }
-
-        double totalSamples = std::max(timeSeconds * sr, 1.0);
-        constexpr double epsilon = 1e-5;
-        double coefficient = std::exp(std::log(epsilon) / totalSamples);
-        if (!std::isfinite(coefficient) || coefficient < 0.0 || coefficient >= 1.0)
-        {
-            coefficient = 0.0;
-        }
-
-        double delta = (target - value) * (1.0 - coefficient);
-        if (!std::isfinite(delta))
-        {
-            value = target;
-            return true;
-        }
-
-        double next = value + delta;
-        if (target >= value)
-            next = std::min(next, target);
-        else
-            next = std::max(next, target);
-
-        value = next;
-
-        double tolerance = std::max(1e-5, std::abs(target) * 1e-5);
-        if (std::abs(value - target) <= tolerance)
-        {
-            value = target;
-            return true;
-        }
-        return false;
-    };
-
-    switch (stage)
-    {
-    case EnvelopeStage::Idle:
-        value = 0.0;
-        break;
-    case EnvelopeStage::Attack:
-        if (advanceCurved(1.0, attack))
-            stage = EnvelopeStage::Decay;
-        break;
-    case EnvelopeStage::Decay:
-        if (advanceCurved(safeSustain, decay))
-            stage = EnvelopeStage::Sustain;
-        break;
-    case EnvelopeStage::Sustain:
-        value = safeSustain;
-        break;
-    case EnvelopeStage::Release:
-        if (advanceCurved(0.0, release))
-        {
-            stage = EnvelopeStage::Idle;
-            value = 0.0;
-        }
-        break;
-    }
-
-    if (!std::isfinite(value))
-        value = 0.0;
-    if (value < 0.0)
-        value = 0.0;
-    if (value > 1.0)
-        value = 1.0;
-
-    return value;
-}
 
 struct TrackModulationState
 {
-    std::array<double, 3> lfoPhase{0.0, 0.0, 0.0};
-    std::array<double, 3> lfoValue{0.0, 0.0, 0.0};
+    std::array<double, kMaxLfos> lfoPhase{};
+    std::array<double, kMaxLfos> lfoValue{};
     std::atomic<double> envelopeValue{0.0};
     std::array<double, 2> macroValue{0.0, 0.0};
     std::vector<double> parameterAmounts;
+    std::array<double, kModSourceCount> sourceValues{};
 };
 
 void prepareModulationParameters(TrackModulationState& modulation)
@@ -609,21 +502,42 @@ void prepareModulationParameters(TrackModulationState& modulation)
         std::fill(modulation.parameterAmounts.begin(), modulation.parameterAmounts.end(), 0.0);
 }
 
+struct SampleVoice {
+    std::shared_ptr<const SampleBuffer> buffer;
+    int note = 60;
+    double position = 0.0;
+    double increment = 1.0;
+    double velocity = 1.0;
+    double envelope = 0.0;
+    EnvelopeStage stage = EnvelopeStage::Attack;
+    EnvelopeProgress envelopeProgress;
+};
+
+struct NativeFxFrame { double threshold = -12, ratio = 4, mix = .4, sourceLevel = 0, rate = 44100; };
 struct TrackPlaybackState {
+    input::Reader inputReader;
+    bool inputWasMonitoring=false;
+    bool midiWasAudible=true;
+    std::shared_ptr<meter::Level> meter;
+    double peakLeft=0,peakRight=0;
+    std::array<NativeFxFrame, 64> nativeFxFrames;
     TrackType type = TrackType::Synth;
     int currentMidiNote = 69;
     double currentFrequency = midiNoteToFrequency(69);
     int currentStep = 0;
+    piano::Playback pianoPlayback;
     bool samplePlaying = false;
+    bool sampleDrumMode = false;
+    std::shared_ptr<const SampleBankBuffers> sampleBank;
+    std::vector<SampleVoice> sampleVoices;
     double samplePosition = 0.0;
     double sampleIncrement = 1.0;
     std::shared_ptr<const SampleBuffer> sampleBuffer;
     size_t sampleFrameCount = 0;
     double volume = 1.0;
     double pan = 0.0;
-    double lowGain = 0.0;
-    double midGain = 0.0;
-    double highGain = 0.0;
+    eq::Processor eqProcessor;
+    int spectrumTrack=0;
     double lastSampleRate = 0.0;
     double feedbackAmount = 0.0;
     double formantNormalized = 0.5;
@@ -632,7 +546,6 @@ struct TrackPlaybackState {
     BiquadFilter formantFilter;
     double pitchBaseOffset = 0.0;
     double pitchRangeSemitones = 0.0;
-    double pitchEnvelope = 0.0;
     double pitchEnvelopeStep = 1.0;
     double stepVelocity = 1.0;
     double stepPan = 0.0;
@@ -640,9 +553,6 @@ struct TrackPlaybackState {
     double lastAppliedFormant = -1.0;
     double lastAppliedResonance = -1.0;
     int lastParameterStep = -1;
-    BiquadFilter lowShelf;
-    BiquadFilter midPeak;
-    BiquadFilter highShelf;
     double synthAttack = 0.01;
     double synthDecay = 0.2;
     double synthSustain = 0.8;
@@ -657,7 +567,6 @@ struct TrackPlaybackState {
     double sampleLastLeft = 0.0;
     double sampleLastRight = 0.0;
     bool sampleTailActive = false;
-    bool eqEnabled = true;
     bool delayEnabled = false;
     double delayTimeMs = 350.0;
     double delayFeedback = 0.35;
@@ -684,14 +593,18 @@ struct TrackPlaybackState {
     double vstPreparedSampleRate = 0.0;
     int vstPreparedBlockSize = 0;
     struct SynthVoice {
+        kj::SynthOscillatorBank oscillatorBank;
+        double pitchEnvelope = 0.0;
         int midiNote = 69;
         double frequency = midiNoteToFrequency(69);
+        double frequencyNote = -1000.0;
         double phase = 0.0;
         double lastOutput = 0.0;
         double velocity = 1.0;
         double velocitySmoothed = 1.0;
         double envelope = 0.0;
         EnvelopeStage envelopeStage = EnvelopeStage::Idle;
+        EnvelopeProgress envelopeProgress;
     };
     std::vector<SynthVoice> voices;
     int midiChannel = 0;
@@ -699,6 +612,74 @@ struct TrackPlaybackState {
     std::vector<int> activeMidiNotes;
     TrackModulationState modulation;
 };
+
+void processNativeRackEffect(void* context, const std::string& key, int offset, double& processedLeft, double& processedRight) {
+    auto& state = *static_cast<TrackPlaybackState*>(context);
+    const auto& frame = state.nativeFxFrames[offset];
+    if (key == "kj:eq") {
+        const float inputLeft=static_cast<float>(processedLeft),inputRight=static_cast<float>(processedRight);
+        state.eqProcessor.process(processedLeft, processedRight);
+        spectrum::capture(state.spectrumTrack,static_cast<float>(processedLeft),static_cast<float>(processedRight),inputLeft,inputRight);
+    }
+
+    if (key == "kj:compressor") {
+        if (state.compressorEnabled)
+        {
+            double inputLevel = std::max(std::abs(processedLeft), std::abs(processedRight));
+            double inputDb = 20.0 * std::log10(inputLevel + 1e-12);
+            double gainDb = 0.0;
+            double compressorThreshold = frame.threshold;
+            double compressorRatio = std::max(frame.ratio, kCompressorRatioMin);
+            if (inputDb > compressorThreshold)
+            {
+                double overDb = inputDb - compressorThreshold;
+                double compressedDb = compressorThreshold + overDb / compressorRatio;
+                gainDb = compressedDb - inputDb;
+            }
+            double targetGain = std::pow(10.0, gainDb / 20.0);
+            if (!std::isfinite(targetGain))
+            targetGain = 1.0;
+            double coeff = (targetGain < state.compressorGain) ? state.compressorAttackCoeff
+            : state.compressorReleaseCoeff;
+            state.compressorGain = targetGain + coeff * (state.compressorGain - targetGain);
+            if (!std::isfinite(state.compressorGain))
+            state.compressorGain = 1.0;
+            processedLeft *= state.compressorGain;
+            processedRight *= state.compressorGain;
+        }
+        else
+        {
+            state.compressorGain = 1.0;
+        }
+
+    }
+    if (key == "kj:delay" && state.delayEnabled && state.delayEffect)
+    {
+        state.delayEffect->setMix(static_cast<float>(frame.mix));
+        float delayLeft = static_cast<float>(processedLeft);
+        float delayRight = static_cast<float>(processedRight);
+        state.delayEffect->process(&delayLeft, &delayRight, 1);
+        processedLeft = delayLeft;
+        processedRight = delayRight;
+    }
+
+    if (key == "kj:sidechain") {
+        double sidechainGain = 1.0;
+        if (state.sidechain.enabled())
+        {
+            double sourceLevel = frame.sourceLevel;
+            sidechainGain = state.sidechain.computeGain(sourceLevel, frame.rate);
+        }
+        else
+        {
+            state.sidechain.resetEnvelope();
+        }
+
+        processedLeft *= sidechainGain;
+        processedRight *= sidechainGain;
+
+    }
+}
 
 void releaseDelayEffect(TrackPlaybackState& state)
 {
@@ -709,6 +690,7 @@ void releaseDelayEffect(TrackPlaybackState& state)
 
 void resetSamplePlaybackState(TrackPlaybackState& state)
 {
+    state.sampleVoices.clear();
     state.samplePlaying = false;
     state.samplePosition = 0.0;
     state.sampleIncrement = 1.0;
@@ -726,7 +708,6 @@ void resetSamplePlaybackState(TrackPlaybackState& state)
 
 void resetSynthPlaybackState(TrackPlaybackState& state)
 {
-    state.pitchEnvelope = 0.0;
     state.voices.clear();
     state.synthGainSmoothed = 1.0;
     resetFilterState(state.formantFilter);
@@ -762,9 +743,6 @@ void updateMixerState(TrackPlaybackState& state, const Track& track, double samp
     double sr = sampleRate > 0.0 ? sampleRate : 44100.0;
     double newVolume = std::clamp(static_cast<double>(track.volume), 0.0, 1.0);
     double newPan = std::clamp(static_cast<double>(track.pan), -1.0, 1.0);
-    double newLow = static_cast<double>(track.lowGainDb);
-    double newMid = static_cast<double>(track.midGainDb);
-    double newHigh = static_cast<double>(track.highGainDb);
     double newFormant = std::clamp(static_cast<double>(track.formant), 0.0, 1.0);
     double newResonance = std::clamp(static_cast<double>(track.resonance), 0.0, 1.0);
     double newFeedback = std::clamp(static_cast<double>(track.feedback), 0.0, 1.0);
@@ -801,13 +779,9 @@ void updateMixerState(TrackPlaybackState& state, const Track& track, double samp
     double newSidechainAmount = std::clamp(static_cast<double>(track.sidechainAmount), 0.0, 1.0);
     double newSidechainAttack = std::clamp(static_cast<double>(track.sidechainAttack), 0.0, 4.0);
     double newSidechainRelease = std::clamp(static_cast<double>(track.sidechainRelease), 0.0, 4.0);
-    bool newEqEnabled = track.eqEnabled;
     bool requestedDelayEnabled = track.delayEnabled;
 
     bool sampleRateChanged = std::abs(state.lastSampleRate - sr) > 1e-6;
-    bool lowChanged = sampleRateChanged || std::abs(state.lowGain - newLow) > 1e-6;
-    bool midChanged = sampleRateChanged || std::abs(state.midGain - newMid) > 1e-6;
-    bool highChanged = sampleRateChanged || std::abs(state.highGain - newHigh) > 1e-6;
     bool formantChanged = sampleRateChanged || std::abs(state.formantNormalized - newFormant) > 1e-6;
     bool resonanceChanged = sampleRateChanged || std::abs(state.formantResonance - newResonance) > 1e-6;
     bool pitchRangeChanged = sampleRateChanged || std::abs(state.pitchRangeSemitones - newPitchRange) > 1e-6;
@@ -826,21 +800,7 @@ void updateMixerState(TrackPlaybackState& state, const Track& track, double samp
     bool compressorAttackChanged = std::abs(state.compressorAttack - newCompressorAttack) > 1e-6;
     bool compressorReleaseChanged = std::abs(state.compressorRelease - newCompressorRelease) > 1e-6;
 
-    if (lowChanged)
-    {
-        configureLowShelf(state.lowShelf, sr, kLowShelfFrequency, newLow);
-        state.lowGain = newLow;
-    }
-    if (midChanged)
-    {
-        configurePeaking(state.midPeak, sr, kMidPeakFrequency, newMid, kMidPeakQ);
-        state.midGain = newMid;
-    }
-    if (highChanged)
-    {
-        configureHighShelf(state.highShelf, sr, kHighShelfFrequency, newHigh);
-        state.highGain = newHigh;
-    }
+    state.eqProcessor.configure(track, sr);
     if (formantChanged || resonanceChanged)
     {
         state.formantNormalized = newFormant;
@@ -859,24 +819,6 @@ void updateMixerState(TrackPlaybackState& state, const Track& track, double samp
         state.pitchRangeSemitones = newPitchRange;
         state.pitchEnvelopeStep = computePitchEnvelopeStep(sr, newPitchRange);
     }
-
-    bool eqEnabledChanged = state.eqEnabled != newEqEnabled;
-
-    if (sampleRateChanged || lowChanged || midChanged || highChanged)
-    {
-        resetFilterState(state.lowShelf);
-        resetFilterState(state.midPeak);
-        resetFilterState(state.highShelf);
-    }
-
-    if (eqEnabledChanged)
-    {
-        resetFilterState(state.lowShelf);
-        resetFilterState(state.midPeak);
-        resetFilterState(state.highShelf);
-    }
-
-    state.eqEnabled = newEqEnabled;
 
     state.volume = newVolume;
     state.pan = newPan;
@@ -1018,11 +960,12 @@ std::array<double, kModSourceCount> evaluateModulationSources(TrackPlaybackState
         return std::clamp(shaped, -1.0, 1.0);
     };
 
-    for (size_t i = 0; i < modulation.lfoPhase.size(); ++i)
+    const int enabledLfos=lfoCount();
+    for (size_t i = 0; i < static_cast<size_t>(enabledLfos); ++i)
     {
-        double rate = static_cast<double>(trackGetLfoRate(track.id, static_cast<int>(i)));
+        double rate = static_cast<double>(track.lfoSettings[i].rateHz);
         if (!std::isfinite(rate) || rate <= 0.0)
-            rate = kDefaultLfoFrequencies[i];
+            rate = i<kDefaultLfoFrequencies.size()?kDefaultLfoFrequencies[i]:1.0;
 
         double increment = twoPi * rate / sr;
         double phase = modulation.lfoPhase[i] + increment;
@@ -1033,8 +976,8 @@ std::array<double, kModSourceCount> evaluateModulationSources(TrackPlaybackState
             phase += twoPi;
         modulation.lfoPhase[i] = phase;
 
-        LfoShape shape = trackGetLfoShape(track.id, static_cast<int>(i));
-        double deform = static_cast<double>(trackGetLfoDeform(track.id, static_cast<int>(i)));
+        LfoShape shape = track.lfoSettings[i].shape;
+        double deform = static_cast<double>(track.lfoSettings[i].deform);
         modulation.lfoValue[i] = evaluateLfoValue(phase, shape, deform);
     }
 
@@ -1045,8 +988,8 @@ std::array<double, kModSourceCount> evaluateModulationSources(TrackPlaybackState
     modulation.envelopeValue.store(envelope, std::memory_order_relaxed);
 
     std::array<double, kModSourceCount> sources{};
-    for (size_t i = 0; i < kDefaultLfoFrequencies.size(); ++i)
-        sources[i] = modulation.lfoValue[i];
+    for (int i = 0; i < enabledLfos; ++i)
+        sources[lfoSourceId(i)] = modulation.lfoValue[i];
     sources[3] = modulation.envelopeValue;
     sources[4] = modulation.macroValue[0];
     sources[5] = modulation.macroValue[1];
@@ -1063,13 +1006,14 @@ void updateTrackModulationState(TrackPlaybackState& state,
     int parameterCount = static_cast<int>(modulation.parameterAmounts.size());
 
     auto sources = evaluateModulationSources(state, track, sampleRate);
+    modulation.sourceValues = sources;
 
     if (!assignments || assignments->empty())
         return;
 
     for (const auto& assignment : *assignments)
     {
-        if (assignment.parameterIndex < 0 || assignment.parameterIndex >= parameterCount)
+        if (!assignment.vstSlotId.empty() || assignment.parameterIndex < 0 || assignment.parameterIndex >= parameterCount)
             continue;
         if (assignment.sourceIndex < 0 || assignment.sourceIndex >= static_cast<int>(kModSourceCount))
             continue;
@@ -1112,6 +1056,7 @@ double applyModulatedParameter(double base, const ModParameterInfo& info, double
 
 struct TrackModulatedParameters
 {
+    std::array<SynthOscillatorSettings, kSynthOscillatorCount> synthOscillators{};
     double volume = 0.0;
     double pan = 0.0;
     double synthPitch = 0.0;
@@ -1155,6 +1100,21 @@ TrackModulatedParameters computeTrackModulatedParameters(const TrackPlaybackStat
     };
 
     result.volume = apply(state.volume, lookup.volume);
+    result.synthOscillators = track.synthOscillators;
+    static const std::array<int, 6> wavetableIndices = {
+        modMatrixGetParameterIndex(ModMatrixParameter::SynthOsc1WavetablePosition),
+        modMatrixGetParameterIndex(ModMatrixParameter::SynthOsc1WavetableMix),
+        modMatrixGetParameterIndex(ModMatrixParameter::SynthOsc2WavetablePosition),
+        modMatrixGetParameterIndex(ModMatrixParameter::SynthOsc2WavetableMix),
+        modMatrixGetParameterIndex(ModMatrixParameter::SynthOsc3WavetablePosition),
+        modMatrixGetParameterIndex(ModMatrixParameter::SynthOsc3WavetableMix),
+    };
+    for (size_t osc = 0; osc < kSynthOscillatorCount; ++osc)
+    {
+        auto& settings = result.synthOscillators[osc];
+        settings.wavetablePosition = static_cast<float>(apply(settings.wavetablePosition, wavetableIndices[osc * 2]));
+        settings.wavetableMix = static_cast<float>(apply(settings.wavetableMix, wavetableIndices[osc * 2 + 1]));
+    }
     result.pan = apply(state.pan, lookup.pan);
     result.synthPitch = apply(state.pitchBaseOffset, lookup.synthPitch);
     result.synthFormant = apply(state.formantNormalized, lookup.synthFormant);
@@ -1314,6 +1274,9 @@ void sequencerWarmupLoop()
 // for future passes.
 void audioLoop() {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
+#ifdef KJ_ENABLE_VST3
+    kj::setTrackVst3AudioActive(true);
+#endif
 
     std::unique_ptr<AudioDeviceHandler> deviceHandler;
     UINT32 bufferFrameCount = 0;
@@ -1488,6 +1451,9 @@ void audioLoop() {
     struct TrackDataSnapshot
     {
         std::vector<Track> tracks;
+        std::vector<std::shared_ptr<input::Buffer>> inputs;
+        std::vector<std::shared_ptr<meter::Level>> meters;
+        std::vector<std::shared_ptr<piano::Runtime>> pianoPatterns;
         std::vector<int> trackStepCounts;
         std::vector<std::pair<int, std::vector<ModMatrixAssignment>>> assignmentsByTrack;
         std::vector<std::vector<bool>> stepStatesByTrack;
@@ -1572,13 +1538,8 @@ void audioLoop() {
         }
     };
 
-    TrackDataSnapshot trackSnapshotA;
-    TrackDataSnapshot trackSnapshotB;
-    trackSnapshotA.reserve();
-    trackSnapshotB.reserve();
-    std::atomic<TrackDataSnapshot*> activeTrackSnapshot{ &trackSnapshotA };
+    PlaybackSnapshot<TrackDataSnapshot> activeTrackSnapshot;
     std::atomic<bool> cacheThreadRunning{ true };
-    ModulationWorker modulationWorker;
     std::vector<TrackModulatedParameters> fallbackModulationParameters;
 
     auto populateTrackSnapshot = [&](TrackDataSnapshot& snapshot)
@@ -1586,10 +1547,12 @@ void audioLoop() {
         auto tracks = getTracks();
         snapshot.prepareForTracks(tracks.size());
         snapshot.tracks = std::move(tracks);
+        snapshot.inputs=input::synchronize(snapshot.tracks);
+        snapshot.meters=meter::synchronize(snapshot.tracks);
 
         for (size_t i = 0; i < snapshot.tracks.size(); ++i)
         {
-            snapshot.trackStepCounts[i] = getSequencerStepCount(snapshot.tracks[i].id);
+            snapshot.trackStepCounts[i] = snapshot.tracks[i].type==TrackType::AudioIn?0:getSequencerStepCount(snapshot.tracks[i].id);
             snapshot.assignmentsByTrack[i].first = snapshot.tracks[i].id;
             int stepCount = std::clamp(snapshot.trackStepCounts[i], 0, static_cast<int>(kCachedStepCapacity));
             snapshot.stepStatesByTrack[i].assign(stepCount, false);
@@ -1621,6 +1584,8 @@ void audioLoop() {
         for (size_t i = 0; i < snapshot.tracks.size(); ++i)
         {
             int trackId = snapshot.tracks[i].id;
+            if (snapshot.pianoPatterns.size() != snapshot.tracks.size()) snapshot.pianoPatterns.resize(snapshot.tracks.size());
+            snapshot.pianoPatterns[i] = piano::prepare(trackId);
             int stepCount = snapshot.trackStepCounts[i];
             for (int step = 0; step < stepCount && step < static_cast<int>(kCachedStepCapacity); ++step)
             {
@@ -1647,22 +1612,24 @@ void audioLoop() {
         }
     };
 
-    populateTrackSnapshot(trackSnapshotA);
+    activeTrackSnapshot.publish(populateTrackSnapshot);
+    uint64_t inputRenderBlock=0;
     std::thread cacheUpdater([&]()
     {
         while (cacheThreadRunning.load(std::memory_order_acquire) && running.load(std::memory_order_acquire))
         {
-            TrackDataSnapshot* current = activeTrackSnapshot.load(std::memory_order_acquire);
-            TrackDataSnapshot* staging = (current == &trackSnapshotA) ? &trackSnapshotB : &trackSnapshotA;
-            populateTrackSnapshot(*staging);
-            activeTrackSnapshot.store(staging, std::memory_order_release);
+            activeTrackSnapshot.publish(populateTrackSnapshot);
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     });
 
+    std::wstring desiredDeviceId=getRequestedAudioOutputDeviceId();
     while (running.load(std::memory_order_acquire)) {
+#ifdef KJ_ENABLE_VST3
+        kj::serviceTrackVst3Changes();
+#endif
         bool changeRequested = deviceChangeRequested.exchange(false);
-        std::wstring desiredDeviceId = gRequestedDeviceIds[gRequestedDeviceIndex.load(std::memory_order_acquire)];
+        if(changeRequested)desiredDeviceId=getRequestedAudioOutputDeviceId();
 
         if (changeRequested) {
             audioSequencerReady.store(false, std::memory_order_release);
@@ -1740,6 +1707,7 @@ void audioLoop() {
             bufferFrameCount = deviceHandler->bufferFrameCount();
             format = deviceHandler->format();
             sampleRate = format ? static_cast<double>(format->nSamplesPerSec) : 44100.0;
+            vstDeviceSampleRate.store(sampleRate, std::memory_order_relaxed);
             deviceReady = true;
             stepSampleCounter = 0.0;
             previousPlaying = false;
@@ -1768,14 +1736,12 @@ void audioLoop() {
             snapshot.activeName = deviceHandler->deviceName();
             if (usedFallback) {
                 snapshot.requestedId.clear();
-                int nextRequested = gRequestedDeviceIndex.load(std::memory_order_relaxed) ^ 1;
-                gRequestedDeviceIds[nextRequested].clear();
-                gRequestedDeviceIndex.store(nextRequested, std::memory_order_release);
+                std::lock_guard<std::mutex> lock(gDeviceStateMutex);
+                // An open completion must not overwrite a newer UI request.
+                if(gRequestedDeviceId==desiredDeviceId)gRequestedDeviceId.clear();
+                desiredDeviceId.clear();
             } else {
-                snapshot.requestedId = desiredDeviceId;
-                int nextRequested = gRequestedDeviceIndex.load(std::memory_order_relaxed) ^ 1;
-                gRequestedDeviceIds[nextRequested] = desiredDeviceId;
-                gRequestedDeviceIndex.store(nextRequested, std::memory_order_release);
+                snapshot.requestedId=desiredDeviceId;
             }
             publishDeviceSnapshot(snapshot);
             audioSequencerReady.store(true, std::memory_order_release);
@@ -1837,6 +1803,8 @@ void audioLoop() {
                 void* context = deviceHandler->streamCallbackContext();
                 callback(data, available, format, context);
             }
+            bool outputClipped=false;
+            double masterPeakLeft=0,masterPeakRight=0;
             BYTE* rawData = data;
             bool bufferIsFloat = isFloatWaveFormat(format);
             bool bufferIsPcm16 = isPcm16WaveFormat(format);
@@ -1855,6 +1823,7 @@ void audioLoop() {
                 return static_cast<std::int16_t>(std::lround(clamped * 32767.0));
             };
             auto writeFrame = [&](UINT32 frameIndex, double left, double right) {
+                captureRecordingFrame(left, right, static_cast<unsigned>(sampleRate));
                 if (bufferIsFloat && floatSamples) {
                     UINT32 base = frameIndex * channelCount;
                     float leftFloat = static_cast<float>(left);
@@ -1891,34 +1860,22 @@ void audioLoop() {
             double stepDurationSamples = sampleRate * 60.0 / (static_cast<double>(bpm) * 4.0);
             if (stepDurationSamples < 1.0) stepDurationSamples = 1.0;
 
-            TrackDataSnapshot* trackSnapshot = activeTrackSnapshot.load(std::memory_order_acquire);
-            const auto& trackInfos = trackSnapshot ? trackSnapshot->tracks : trackSnapshotA.tracks;
-            const auto& trackStepCounts = trackSnapshot ? trackSnapshot->trackStepCounts : trackSnapshotA.trackStepCounts;
-            const auto& assignmentsByTrack = trackSnapshot ? trackSnapshot->assignmentsByTrack : trackSnapshotA.assignmentsByTrack;
-            const auto& stepStatesByTrack = trackSnapshot ? trackSnapshot->stepStatesByTrack : trackSnapshotA.stepStatesByTrack;
-            const auto& stepNotesByTrack = trackSnapshot ? trackSnapshot->stepNotesByTrack : trackSnapshotA.stepNotesByTrack;
-            const auto& stepVelocityByTrack = trackSnapshot ? trackSnapshot->stepVelocityByTrack : trackSnapshotA.stepVelocityByTrack;
-            const auto& stepPanByTrack = trackSnapshot ? trackSnapshot->stepPanByTrack : trackSnapshotA.stepPanByTrack;
-            const auto& stepPitchByTrack = trackSnapshot ? trackSnapshot->stepPitchByTrack : trackSnapshotA.stepPitchByTrack;
+            auto trackSnapshot = activeTrackSnapshot.read();
+            const auto& trackInfos = trackSnapshot->tracks;
+            const bool anySolo=std::any_of(trackInfos.begin(),trackInfos.end(),[](const Track& t){return t.solo;});
+            const bool monitorStopped=input::monitorWhileStopped();
+            ++inputRenderBlock;
+            const bool hasMonitoredInput=std::any_of(trackInfos.begin(),trackInfos.end(),[](const Track& t){return t.type==TrackType::AudioIn&&t.inputMonitor;});
+            const auto& trackStepCounts = trackSnapshot->trackStepCounts;
+            const auto& assignmentsByTrack = trackSnapshot->assignmentsByTrack;
+            const auto& stepStatesByTrack = trackSnapshot->stepStatesByTrack;
+            const auto& stepNotesByTrack = trackSnapshot->stepNotesByTrack;
+            const auto& stepVelocityByTrack = trackSnapshot->stepVelocityByTrack;
+            const auto& stepPanByTrack = trackSnapshot->stepPanByTrack;
+            const auto& stepPitchByTrack = trackSnapshot->stepPitchByTrack;
 
-            uint64_t modulationRequestId = 0;
-            const auto* modulatedParameters = modulationWorker.consumeLatest(modulationRequestId);
-            (void)modulationRequestId;
-            modulationWorker.submit(trackInfos, assignmentsByTrack, playbackStates, sampleRate);
-            if (!modulatedParameters || modulatedParameters->size() != trackInfos.size())
-            {
-                fallbackModulationParameters.resize(trackInfos.size());
-                for (size_t trackIndex = 0; trackIndex < trackInfos.size(); ++trackIndex)
-                {
-                    const auto& trackInfo = trackInfos[trackIndex];
-                    auto stateIt = playbackStates.find(trackInfo.id);
-                    if (stateIt != playbackStates.end())
-                        fallbackModulationParameters[trackIndex] = computeTrackModulatedParameters(stateIt->second, trackInfo);
-                    else
-                        fallbackModulationParameters[trackIndex] = TrackModulatedParameters{};
-                }
-                modulatedParameters = &fallbackModulationParameters;
-            }
+            fallbackModulationParameters.resize(trackInfos.size());
+            const auto* modulatedParameters = &fallbackModulationParameters;
 
             int activeTrackId = getActiveSequencerTrackId();
 
@@ -1945,6 +1902,9 @@ void audioLoop() {
                 bool inserted = insertResult.second;
                 TrackType previousType = state.type;
                 bool typeChanged = inserted || previousType != trackInfo.type;
+#ifdef KJ_ENABLE_VST3
+                if (typeChanged && !inserted) kj::stopTrackVst3Audio(trackInfo.id);
+#endif
                 state.type = trackInfo.type;
 
                 int previousMidiChannel = state.midiChannel;
@@ -1980,7 +1940,6 @@ void audioLoop() {
 
                     resetSamplePlaybackState(state);
                     resetSynthPlaybackState(state);
-                    state.pitchEnvelope = 0.0;
                     state.currentMidiNote = 69;
                     state.currentFrequency = midiNoteToFrequency(69);
                     state.lastParameterStep = -1;
@@ -2001,7 +1960,11 @@ void audioLoop() {
                     state.vstPreparedBlockSize = 0;
                     state.vstPrepareErrorNotified = false;
                     auto sampleBuffer = trackGetSampleBuffer(trackInfo.id);
-                    bool sampleBufferChanged = sampleBuffer != state.sampleBuffer;
+                    bool drumMode = trackGetSampleDrumMode(trackInfo.id);
+                    bool sampleBufferChanged = (!drumMode && sampleBuffer != state.sampleBuffer) ||
+                                               drumMode != state.sampleDrumMode;
+                    state.sampleDrumMode = drumMode;
+                    state.sampleBank = sampleGetBankBuffers();
                     state.sampleBuffer = std::move(sampleBuffer);
                     state.sampleFrameCount = state.sampleBuffer ? state.sampleBuffer->frameCount() : 0;
                     if (state.sampleBuffer && state.sampleBuffer->sampleRate > 0) {
@@ -2083,6 +2046,17 @@ void audioLoop() {
                     state.currentFrequency = midiNoteToFrequency(state.currentMidiNote);
                 }
 
+                bool inputChanged=state.inputReader.bind(trackSnapshot->inputs[trackIndex]);
+                bool inputMonitoring=trackInfo.inputMonitor&&(isPlaying.load(std::memory_order_relaxed)||monitorStopped);
+                if(trackInfo.type==TrackType::AudioIn&&(inputChanged||state.inputWasMonitoring!=inputMonitoring)){
+                    state.inputReader.reset();
+#ifdef KJ_ENABLE_VST3
+                    kj::stopTrackVst3Audio(trackInfo.id);
+#endif
+                }
+                state.inputWasMonitoring=inputMonitoring;
+                state.inputReader.beginBlock(sampleRate,available,inputRenderBlock);
+                state.meter=trackSnapshot->meters[trackIndex];state.peakLeft=state.peakRight=0;
                 updateMixerState(state, trackInfo, sampleRate);
             }
             if (samplerResetPending) {
@@ -2102,12 +2076,30 @@ void audioLoop() {
 
             std::size_t capturedCount = 0;
 
+            // Audio owns playback state. A small block-rate update avoids job
+            // dispatch, stale result buffers and concurrent mutation of voices.
+            for (size_t index=0; index<trackInfos.size(); ++index) {
+                const auto& track=trackInfos[index];
+                auto it=playbackStates.find(track.id);
+                if(it==playbackStates.end())continue;
+                const std::vector<ModMatrixAssignment>* assignments=nullptr;
+                if(index<assignmentsByTrack.size() && assignmentsByTrack[index].first==track.id)
+                    assignments=&assignmentsByTrack[index].second;
+                updateTrackModulationState(it->second,track,
+                    sampleRate/static_cast<double>(std::max<UINT32>(1,available)),assignments);
+                fallbackModulationParameters[index]=computeTrackModulatedParameters(it->second,track);
+            }
+
             for (UINT32 i = 0; i < available; i++) {
                 bool playing = isPlaying.load(std::memory_order_relaxed);
                 bool stepAdvanced = false;
+                bool transportRestarted = false;
 
                 if (!playing) {
                     if (previousPlaying) {
+#ifdef KJ_ENABLE_VST3
+                        for(const auto& t:trackInfos)if(t.type!=TrackType::AudioIn)kj::stopTrackVst3Audio(t.id);
+#endif
                         requestSequencerReset();
                     }
                     previousPlaying = false;
@@ -2115,13 +2107,15 @@ void audioLoop() {
                     transportSamplePosition = 0.0;
                     for (auto& entry : playbackStates) {
                         auto& state = entry.second;
+                        if(state.type==TrackType::AudioIn)continue;
+                        state.pianoPlayback.runtime.reset();
+                        state.pianoPlayback.lastTick = -1;
                         for (auto& voice : state.voices) {
                             voice.envelope = 0.0;
                             voice.envelopeStage = EnvelopeStage::Idle;
                         }
                         resetSamplePlaybackState(state);
                         state.voices.clear();
-                        state.pitchEnvelope = 0.0;
                         state.lastParameterStep = -1;
                         state.stepVelocity = 1.0;
                         state.stepPan = 0.0;
@@ -2130,7 +2124,9 @@ void audioLoop() {
                         if (state.type == TrackType::MidiOut)
                             sendMidiNotesOffForState(state, state.midiPort, state.midiChannel);
                     }
-                } else {
+                }
+                if(playing || (hasMonitoredInput && monitorStopped)) {
+                    if(playing) {
                     if (!previousPlaying) {
                         requestSequencerReset();
                     }
@@ -2149,6 +2145,7 @@ void audioLoop() {
 
                                 for (auto& entry : playbackStates) {
                                     auto& state = entry.second;
+                                    if(state.type==TrackType::AudioIn)continue;
                                     state.resetScheduled = true;
                                     state.resetFadeGain = 1.0;
                                     state.resetFadeSamples = fadeSamples;
@@ -2156,8 +2153,10 @@ void audioLoop() {
                                     state.resetReason = reason;
                                 }
                             } else {
+                                transportRestarted = true;
                                 for (auto& entry : playbackStates) {
                                     auto& state = entry.second;
+                                    if(state.type==TrackType::AudioIn)continue;
                                     state.resetScheduled = false;
                                     state.resetFadeGain = 1.0;
                                     state.resetFadeSamples = 0;
@@ -2166,6 +2165,7 @@ void audioLoop() {
                                     resetSamplePlaybackState(state);
                                     resetSynthPlaybackState(state);
                                     state.currentStep = 0;
+                                    state.pianoPlayback.runtime.reset();
                                     state.lastParameterStep = -1;
                                     state.stepVelocity = 1.0;
                                     state.stepPan = 0.0;
@@ -2181,6 +2181,7 @@ void audioLoop() {
                         stepAdvanced = true;
                     }
 
+                    } // Transport-only updates; live inputs can render while stopped.
                     double leftValue = 0.0;
                     double rightValue = 0.0;
 
@@ -2213,6 +2214,7 @@ void audioLoop() {
 
                     for (size_t trackIndex = 0; trackIndex < trackInfos.size(); ++trackIndex) {
                         const auto& trackInfo = trackInfos[trackIndex];
+                        if(!playing && trackInfo.type!=TrackType::AudioIn)continue;
                         int trackStepCount = trackStepCounts[trackIndex];
                         auto stateIt = playbackStates.find(trackInfo.id);
                         if (stateIt == playbackStates.end())
@@ -2286,21 +2288,26 @@ void audioLoop() {
                                                    : false;
                             if (trackIndex < stepNotesByTrack.size() &&
                                 stepIndex < static_cast<int>(stepNotesByTrack[trackIndex].size()) &&
-                                (trackInfo.type == TrackType::Synth || trackInfo.type == TrackType::MidiOut || trackInfo.type == TrackType::Synth))
+                                (trackInfo.type == TrackType::Synth || trackInfo.type == TrackType::MidiOut || trackInfo.type == TrackType::Sample || trackInfo.type == TrackType::Vst3))
                             {
                                 stepNotes = &stepNotesByTrack[trackIndex][stepIndex];
                             }
 
                             if (stepEnabled) {
                                 gate = true;
-                                if (stepAdvanced) {
+                                if (stepAdvanced || transportRestarted) {
                                     if (stepNotes && (trackInfo.type == TrackType::Synth ||
+                                                      trackInfo.type == TrackType::Vst3 ||
                                                       trackInfo.type == TrackType::MidiOut ||
-                                                      trackInfo.type == TrackType::Synth)) {
+                                                      trackInfo.type == TrackType::Sample)) {
                                         noteOnNotes.reserve(stepNotes->size());
                                         notesPresent.reserve(stepNotes->size());
                                         for (const auto& noteInfo : *stepNotes) {
-                                            int clampedNote = std::clamp(noteInfo.midiNote, 0, 127);
+                                            if (trackInfo.type == TrackType::Sample &&
+                                                ((noteInfo.midiNote >= kSampleDrumNoteBase) != state.sampleDrumMode))
+                                                continue;
+                                            int clampedNote = trackInfo.type == TrackType::Sample ? noteInfo.midiNote
+                                                 : std::clamp(noteInfo.midiNote, 0, 127);
                                             double velocity = std::clamp(static_cast<double>(noteInfo.velocity),
                                                                          static_cast<double>(kTrackStepVelocityMin),
                                                                          static_cast<double>(kTrackStepVelocityMax));
@@ -2320,9 +2327,17 @@ void audioLoop() {
                             }
                         }
 
+                        bool noteAdvanced = stepAdvanced || transportRestarted;
+                        if (trackInfo.type!=TrackType::AudioIn && trackSnapshot && trackIndex < trackSnapshot->pianoPatterns.size() && trackSnapshot->pianoPatterns[trackIndex]) {
+                            int tick = stepIndex * piano::ticksPerStep + std::clamp(static_cast<int>(stepSampleCounter / stepDurationSamples * piano::ticksPerStep), 0, piano::ticksPerStep-1);
+                            noteAdvanced = piano::render(state.pianoPlayback, trackSnapshot->pianoPatterns[trackIndex], tick, false, noteOnNotes, notesPresent, gate);
+                            stepNotes = &state.pianoPlayback.notes;
+                            triggered = !noteOnNotes.empty();
+                        }
+
                         bool stepHasNoteOnEvents = false;
                         if (trackInfo.type == TrackType::Synth || trackInfo.type == TrackType::MidiOut ||
-                            trackInfo.type == TrackType::Synth) {
+                            trackInfo.type == TrackType::Sample || trackInfo.type == TrackType::Vst3) {
                             stepHasNoteOnEvents = !noteOnNotes.empty();
                         } else {
                             stepHasNoteOnEvents = triggered;
@@ -2346,125 +2361,91 @@ void audioLoop() {
                         double trackRight = 0.0;
 
                         if (trackInfo.type == TrackType::Sample) {
-                            if (triggered) {
-                                bool allowRetrigger = !state.samplePlaying ||
-                                                       state.sampleEnvelopeStage == EnvelopeStage::Idle ||
-                                                       state.sampleEnvelopeStage == EnvelopeStage::Release;
-                                if (allowRetrigger) {
-                                    if (state.sampleBuffer && state.sampleFrameCount > 0) {
-                                        state.samplePlaying = true;
-                                        state.samplePosition = 0.0;
-                                        state.sampleEnvelopeStage = EnvelopeStage::Attack;
-                                        state.sampleEnvelope = 0.0;
-                                        state.sampleEnvelopeSmoothed = 0.0;
-                                        state.sampleTailActive = false;
-                                        state.sampleLastLeft = 0.0;
-                                        state.sampleLastRight = 0.0;
-                                    } else {
-                                        state.samplePlaying = false;
-                                        state.sampleEnvelopeStage = EnvelopeStage::Idle;
-                                        state.sampleEnvelope = 0.0;
-                                        state.sampleEnvelopeSmoothed = 0.0;
-                                        state.sampleTailActive = false;
-                                        state.sampleLastLeft = 0.0;
-                                        state.sampleLastRight = 0.0;
+                            if (noteAdvanced) {
+                                // Pitched notes follow their drawn sustain; drums play one-shot tails.
+                                if (!state.sampleDrumMode) {
+                                    for (auto& voice : state.sampleVoices) {
+                                        if (!gate || std::find(notesPresent.begin(), notesPresent.end(), voice.note) == notesPresent.end())
+                                            voice.stage = EnvelopeStage::Release;
                                     }
                                 }
-                            }
-
-                            if (!gate && state.sampleEnvelopeStage != EnvelopeStage::Idle &&
-                                state.sampleEnvelopeStage != EnvelopeStage::Release) {
-                                state.sampleEnvelopeStage = EnvelopeStage::Release;
-                            }
-
-                            size_t playbackFrame = static_cast<size_t>(state.samplePosition);
-
-                            if (state.samplePlaying && state.sampleBuffer) {
-                                size_t index = playbackFrame;
-                                if (index < state.sampleFrameCount) {
-                                    int channels = std::max(state.sampleBuffer->channels, 1);
-                                    const auto& rawSamples = state.sampleBuffer->samples;
-                                    float leftSample = rawSamples[index * channels];
-                                    float rightSample = channels > 1 ? rawSamples[index * channels + 1] : leftSample;
-                                    trackLeft = static_cast<double>(leftSample);
-                                    trackRight = static_cast<double>(rightSample);
-                                    state.sampleLastLeft = trackLeft;
-                                    state.sampleLastRight = trackRight;
-                                    state.sampleTailActive = true;
-                                    state.samplePosition += state.sampleIncrement;
-                                } else {
-                                    state.samplePlaying = false;
-                                    if (state.sampleEnvelopeStage != EnvelopeStage::Idle)
-                                        state.sampleEnvelopeStage = EnvelopeStage::Release;
+                                for (const auto& note : noteOnNotes) {
+                                    std::shared_ptr<const SampleBuffer> buffer;
+                                    if (state.sampleDrumMode) {
+                                        if (note.midiNote < kSampleDrumNoteBase || !state.sampleBank)
+                                            continue;
+                                        size_t lane = static_cast<size_t>(note.midiNote - kSampleDrumNoteBase);
+                                        if (lane >= state.sampleBank->size())
+                                            continue;
+                                        buffer = (*state.sampleBank)[lane];
+                                    } else {
+                                        if (note.midiNote < 0 || note.midiNote > 127)
+                                            continue;
+                                        buffer = state.sampleBuffer;
+                                    }
+                                    if (!buffer || buffer->frameCount() == 0 || buffer->sampleRate <= 0)
+                                        continue;
+                                    // Retrigger the same lane/note while allowing different lanes to overlap.
+                                    state.sampleVoices.erase(std::remove_if(state.sampleVoices.begin(), state.sampleVoices.end(),
+                                        [&](const SampleVoice& voice) { return voice.note == note.midiNote; }), state.sampleVoices.end());
+                                    SampleVoice voice;
+                                    voice.buffer = std::move(buffer);
+                                    voice.note = note.midiNote;
+                                    voice.increment = samplePlaybackIncrement(note.midiNote, state.sampleDrumMode,
+                                        voice.buffer->sampleRate, sampleRate, state.sampleDrumMode ? sampleDrumSettings(trackInfo,note.midiNote-kSampleDrumNoteBase).pitch : state.stepPitchOffset);
+                                    voice.velocity = std::clamp(static_cast<double>(note.velocity), 0.0, 1.0);
+                                    state.sampleVoices.push_back(std::move(voice));
                                 }
                             }
-
-                            if (!state.samplePlaying && state.sampleTailActive &&
-                                state.sampleEnvelopeStage != EnvelopeStage::Idle) {
-                                trackLeft = state.sampleLastLeft;
-                                trackRight = state.sampleLastRight;
-                            }
-
-                            state.sampleEnvelope = advanceEnvelope(state.sampleEnvelopeStage, state.sampleEnvelope,
-                                                                    modulatedParams.sampleAttack, 0.0, 1.0,
-                                                                    modulatedParams.sampleRelease,
-                                                                    sampleRate);
-
-                            double sr = sampleRate > 0.0 ? sampleRate : 44100.0;
-                            double maxDelta = (kSampleEnvelopeSmoothingSeconds > 0.0)
-                                ? (1.0 / (kSampleEnvelopeSmoothingSeconds * sr))
-                                : 1.0;
-                            if (!std::isfinite(maxDelta) || maxDelta <= 0.0)
-                                maxDelta = 1.0;
-                            double delta = state.sampleEnvelope - state.sampleEnvelopeSmoothed;
-                            if (delta > maxDelta)
-                                delta = maxDelta;
-                            else if (delta < -maxDelta)
-                                delta = -maxDelta;
-                            state.sampleEnvelopeSmoothed += delta;
-                            state.modulation.envelopeValue.store(state.sampleEnvelopeSmoothed, std::memory_order_relaxed);
-
-                            double sampleGain = state.sampleEnvelopeSmoothed;
-                            trackLeft *= sampleGain;
-                            trackRight *= sampleGain;
-
-#ifdef DEBUG_AUDIO
-                            if (i == 0) {
-                                double outputAmplitude = 0.5 * (std::abs(trackLeft) + std::abs(trackRight));
-                                std::cout << "[Sampler] track=" << trackInfo.id
-                                          << " frame=" << playbackFrame
-                                          << " cursor=" << state.samplePosition
-                                          << " stage=" << envelopeStageToString(state.sampleEnvelopeStage)
-                                          << " env=" << state.sampleEnvelope
-                                          << " smooth=" << state.sampleEnvelopeSmoothed
-                                          << " gain=" << sampleGain
-                                          << " amp=" << outputAmplitude
-                                          << " playing=" << (state.samplePlaying ? "true" : "false")
-                                          << " tail=" << (state.sampleTailActive ? "true" : "false")
-                                          << std::endl;
-                            }
-#endif
-
-                            if (state.sampleEnvelopeStage == EnvelopeStage::Idle) {
-                                state.sampleTailActive = false;
-                                if (!state.samplePlaying) {
-                                    state.sampleEnvelope = 0.0;
-                                    state.sampleEnvelopeSmoothed = 0.0;
-                                    state.sampleLastLeft = 0.0;
-                                    state.sampleLastRight = 0.0;
+                            double peakEnvelope = 0.0;
+                            for (auto& voice : state.sampleVoices) {
+                                const auto& buffer = *voice.buffer;
+                                size_t frame = static_cast<size_t>(voice.position);
+                                if (frame >= buffer.frameCount()) {
+                                    voice.stage = EnvelopeStage::Idle;
+                                    continue;
                                 }
+                                const auto drum=sampleDrumSettings(trackInfo,voice.note-kSampleDrumNoteBase);
+                                if(state.sampleDrumMode)voice.increment=samplePlaybackIncrement(voice.note,true,buffer.sampleRate,sampleRate,drum.pitch);
+                                voice.envelope = advanceEnvelope(voice.stage, voice.envelope,
+                                    state.sampleDrumMode?std::clamp(double(drum.attack)+modulatedParams.sampleAttack-state.sampleAttack,kSampleEnvelopeSmoothingSeconds,4.0):modulatedParams.sampleAttack, 0.0, 1.0,
+                                    state.sampleDrumMode?std::clamp(double(drum.release)+modulatedParams.sampleRelease-state.sampleRelease,kSampleEnvelopeSmoothingSeconds,4.0):modulatedParams.sampleRelease,
+                                    sampleRate, voice.envelopeProgress, state.sampleDrumMode);
+                                size_t next = std::min(frame + 1, buffer.frameCount() - 1);
+                                double fraction = voice.position - frame;
+                                auto channelSample = [&](int channel) {
+                                    double first = buffer.samples[frame * buffer.channels + channel];
+                                    double second = buffer.samples[next * buffer.channels + channel];
+                                    return first + (second - first) * fraction;
+                                };
+                                double gain = voice.envelope * voice.velocity * (state.sampleDrumMode?drum.volume:1.0);
+                                double pan=state.sampleDrumMode?drum.pan:0;
+                                trackLeft += channelSample(0) * gain * (pan>0?1-pan:1);
+                                trackRight += channelSample(buffer.channels > 1 ? 1 : 0) * gain * (pan<0?1+pan:1);
+                                peakEnvelope = std::max(peakEnvelope, voice.envelope);
+                                voice.position += voice.increment;
                             }
+                            state.sampleVoices.erase(std::remove_if(state.sampleVoices.begin(), state.sampleVoices.end(),
+                                [](const SampleVoice& voice) { return voice.stage == EnvelopeStage::Idle; }), state.sampleVoices.end());
+                            state.samplePlaying = !state.sampleVoices.empty();
+                            state.modulation.envelopeValue.store(peakEnvelope, std::memory_order_relaxed);
                         } else if (trackInfo.type == TrackType::MidiOut) {
                             state.modulation.envelopeValue.store(0.0, std::memory_order_relaxed);
                             state.samplePlaying = false;
                             state.sampleTailActive = false;
                             state.voices.clear();
 
-                            if (!gate) {
+                            bool midiAudible=trackAudible(trackInfo,anySolo);
+                            bool midiResuming=midiAudible&&!state.midiWasAudible;
+                            state.midiWasAudible=midiAudible;
+                            if (!gate || !midiAudible) {
                                 state.sampleEnvelopeStage = EnvelopeStage::Idle;
                                 sendMidiNotesOffForState(state, state.midiPort, state.midiChannel);
-                            } else if (stepAdvanced) {
+                            } else if (noteAdvanced || midiResuming) {
                                 std::vector<int> notesThisStep = notesPresent;
+                                // Between piano ticks, present is intentionally empty. Resume
+                                // from its retained held notes rather than waiting for a new note.
+                                if(midiResuming&&stepNotes)for(const auto& n:*stepNotes)notesThisStep.push_back(n.midiNote);
                                 std::sort(notesThisStep.begin(), notesThisStep.end());
                                 notesThisStep.erase(std::unique(notesThisStep.begin(), notesThisStep.end()), notesThisStep.end());
 
@@ -2495,6 +2476,12 @@ void audioLoop() {
                                     midiOutputSendNoteOn(state.midiPort, state.midiChannel, note, eventVelocity);
                                 }
 
+                                if(midiResuming&&stepNotes)for(const auto& noteInfo:*stepNotes){
+                                    int note=std::clamp(noteInfo.midiNote,0,127);
+                                    bool started=std::any_of(noteOnNotes.begin(),noteOnNotes.end(),[note](const StepNoteInfo& n){return n.midiNote==note;});
+                                    if(!started&&std::binary_search(notesThisStep.begin(),notesThisStep.end(),note))
+                                        midiOutputSendNoteOn(state.midiPort,state.midiChannel,note,std::clamp(int(std::lround(noteInfo.velocity*127)),1,127));
+                                }
                                 state.activeMidiNotes = std::move(notesThisStep);
                             }
                         } else if (trackInfo.type == TrackType::Synth) {
@@ -2507,11 +2494,10 @@ void audioLoop() {
                                 }
                             }
 
-                            if (gate && stepAdvanced) {
+                            if (gate && noteAdvanced) {
                                 std::vector<TrackPlaybackState::SynthVoice> updatedVoices;
                                 size_t stepNoteCount = stepNotes ? stepNotes->size() : 0;
                                 updatedVoices.reserve(stepNoteCount + state.voices.size());
-                                bool createdNewVoice = false;
 
                                 auto findExistingVoice = [&state](int note) {
                                     return std::find_if(state.voices.begin(), state.voices.end(),
@@ -2534,7 +2520,6 @@ void audioLoop() {
                                             ? *existingIt
                                             : TrackPlaybackState::SynthVoice{};
                                         voice.midiNote = note;
-                                        voice.frequency = midiNoteToFrequency(static_cast<double>(note) + modulatedParams.synthPitch + state.stepPitchOffset);
 
                                         if (!hasExistingVoice) {
                                             voice.velocitySmoothed = noteVelocity;
@@ -2546,11 +2531,13 @@ void audioLoop() {
 
                                         if (restartVoice) {
                                             voice.envelopeStage = EnvelopeStage::Attack;
+                                            voice.envelopeProgress = {};
+                                            voice.oscillatorBank.noteOn(state.synthPhaseSync);
                                             if (state.synthPhaseSync) {
                                                 voice.phase = 0.0;
                                                 voice.lastOutput = 0.0;
                                             }
-                                            createdNewVoice = true;
+                                            voice.pitchEnvelope = 1.0;
                                         }
 
                                         updatedVoices.push_back(voice);
@@ -2561,9 +2548,6 @@ void audioLoop() {
                                     bool noteStillPresent = std::binary_search(notesPresent.begin(), notesPresent.end(),
                                                                                voice.midiNote);
                                     if (noteStillPresent) {
-                                        if (voice.envelopeStage == EnvelopeStage::Release) {
-                                            updatedVoices.push_back(voice);
-                                        }
                                         continue;
                                     }
                                     if (voice.envelopeStage != EnvelopeStage::Idle &&
@@ -2583,15 +2567,12 @@ void audioLoop() {
                                     state.currentFrequency = midiNoteToFrequency(69);
                                 }
 
-                                if (createdNewVoice)
-                                    state.pitchEnvelope = 1.0;
                             }
 
                             double sampleValue = 0.0;
                             if (!state.voices.empty()) {
                                 double pitchRangeSemitones = std::max(0.0, modulatedParams.synthPitchRange - 1.0);
-                                double pitchOffset = modulatedParams.synthPitch + state.stepPitchOffset +
-                                                     state.pitchEnvelope * pitchRangeSemitones;
+                                double pitchOffset = modulatedParams.synthPitch + state.stepPitchOffset;
                                 double feedbackMix = std::clamp(modulatedParams.synthFeedback, 0.0, 0.99);
                                 SynthWaveType waveType = trackInfo.synthWaveType;
                                 double totalVelocity = 0.0;
@@ -2603,9 +2584,14 @@ void audioLoop() {
                                 if (!std::isfinite(velocityMaxDelta) || velocityMaxDelta <= 0.0)
                                     velocityMaxDelta = 1.0;
                                 for (auto& voice : state.voices) {
-                                    double noteWithPitch = static_cast<double>(voice.midiNote) + pitchOffset;
-                                    double frequency = midiNoteToFrequency(noteWithPitch);
-                                    voice.frequency = frequency;
+                                    // A neighbouring note must not restart this voice's pitch sweep.
+                                    double noteWithPitch = static_cast<double>(voice.midiNote) + pitchOffset +
+                                                          voice.pitchEnvelope * pitchRangeSemitones;
+                                    if (noteWithPitch != voice.frequencyNote) {
+                                        voice.frequencyNote = noteWithPitch;
+                                        voice.frequency = midiNoteToFrequency(noteWithPitch);
+                                    }
+                                    double frequency = voice.frequency;
                                     double waveform = 0.0;
                                     switch (waveType)
                                     {
@@ -2629,12 +2615,24 @@ void audioLoop() {
                                         break;
                                     }
                                     }
+                                    if (!trackInfo.synthThreeOscEnabled && trackInfo.synthOscillators[0].wavetableEnabled)
+                                        waveform = kj::wavetableOutput(waveType, voice.phase, modulatedParams.synthOscillators[0]);
                                     if (feedbackMix > 0.0)
                                     {
                                         waveform = waveform * (1.0 - feedbackMix) + voice.lastOutput * feedbackMix;
                                     }
                                     waveform = std::clamp(waveform, -1.0, 1.0);
                                     voice.lastOutput = waveform;
+                                    if (trackInfo.synthThreeOscEnabled)
+                                    {
+                                        waveform = voice.oscillatorBank.render(modulatedParams.synthOscillators,
+                                            waveType, voice.midiNote, sampleRate, state.stepPitchOffset,
+                                            modulatedParams.synthPitch - trackInfo.pitch,
+                                            modulatedParams.synthPitchRange - trackInfo.pitchRange,
+                                            modulatedParams.synthFeedback - trackInfo.feedback,
+                                            modulatedParams.synthFormant - trackInfo.formant,
+                                            modulatedParams.synthResonance - trackInfo.resonance);
+                                    }
                                     double velocityTarget = std::clamp(voice.velocity,
                                                                       static_cast<double>(kTrackStepVelocityMin),
                                                                       static_cast<double>(kTrackStepVelocityMax));
@@ -2655,13 +2653,16 @@ void audioLoop() {
                                                                           modulatedParams.synthDecay,
                                                                           modulatedParams.synthSustain,
                                                                           modulatedParams.synthRelease,
-                                                                          sampleRate);
+                                                                          sampleRate, voice.envelopeProgress);
                                     voice.envelope = envelopeGain;
                                     modulationEnvelope += envelopeGain;
                                     sampleValue += waveform * velocityGain * envelopeGain;
                                     totalVelocity += velocityGain;
                                     double increment = twoPi * frequency / sampleRate;
                                     voice.phase += increment;
+                                    voice.pitchEnvelope = std::max(0.0, voice.pitchEnvelope - state.pitchEnvelopeStep);
+                                    if (voice.pitchEnvelope < 1e-6)
+                                        voice.pitchEnvelope = 0.0;
                                     if (voice.phase >= twoPi)
                                     {
                                         voice.phase = std::fmod(voice.phase, twoPi);
@@ -2688,12 +2689,6 @@ void audioLoop() {
                                 if (!std::isfinite(envelopeAverage))
                                     envelopeAverage = 0.0;
                                 state.modulation.envelopeValue.store(envelopeAverage, std::memory_order_relaxed);
-                                if (state.pitchEnvelope > 0.0)
-                                {
-                                    state.pitchEnvelope = std::max(0.0, state.pitchEnvelope - state.pitchEnvelopeStep);
-                                    if (state.pitchEnvelope < 1e-6)
-                                        state.pitchEnvelope = 0.0;
-                                }
                             } else {
                                 state.synthGainSmoothed = 1.0;
                                 state.modulation.envelopeValue.store(0.0, std::memory_order_relaxed);
@@ -2724,7 +2719,7 @@ void audioLoop() {
                             }
 
                             double blend = std::clamp(modFormant, 0.0, 1.0);
-                            if (blend < 1.0 || modResonance > 0.0) {
+                            if (!trackInfo.synthThreeOscEnabled && (blend < 1.0 || modResonance > 0.0)) {
                                 double filteredLeft = processBiquadSample(state.formantFilter, trackLeft, false);
                                 double filteredRight = processBiquadSample(state.formantFilter, trackRight, true);
                                 trackLeft = filteredLeft * (1.0 - blend) + trackLeft * blend;
@@ -2734,6 +2729,12 @@ void audioLoop() {
                             state.modulation.envelopeValue.store(0.0, std::memory_order_relaxed);
                             state.activeMidiNotes.clear();
                             state.voices.clear();
+                        }
+
+                        if(trackInfo.type==TrackType::AudioIn){
+                            trackLeft=trackRight=0;
+                            if(trackInfo.inputMonitor&&(playing||monitorStopped))state.inputReader.read(trackInfo.inputChannel,trackInfo.inputStereo,trackLeft,trackRight);
+                            state.stepPan=0;state.stepVelocity=1;
                         }
 
                         if (state.resetScheduled) {
@@ -2767,92 +2768,38 @@ void audioLoop() {
 
                         double processedLeft = trackLeft;
                         double processedRight = trackRight;
-                        if (state.eqEnabled)
-                        {
-                            processedLeft = processBiquadSample(state.lowShelf, processedLeft, false);
-                            processedLeft = processBiquadSample(state.midPeak, processedLeft, false);
-                            processedLeft = processBiquadSample(state.highShelf, processedLeft, false);
-
-                            processedRight = processBiquadSample(state.lowShelf, processedRight, true);
-                            processedRight = processBiquadSample(state.midPeak, processedRight, true);
-                            processedRight = processBiquadSample(state.highShelf, processedRight, true);
-                        }
-
-                        if (state.compressorEnabled)
-                        {
-                            double inputLevel = std::max(std::abs(processedLeft), std::abs(processedRight));
-                            double inputDb = 20.0 * std::log10(inputLevel + 1e-12);
-                            double gainDb = 0.0;
-                            double compressorThreshold = modulatedParams.compressorThreshold;
-                            double compressorRatio = std::max(modulatedParams.compressorRatio, kCompressorRatioMin);
-                            if (inputDb > compressorThreshold)
-                            {
-                                double overDb = inputDb - compressorThreshold;
-                                double compressedDb = compressorThreshold + overDb / compressorRatio;
-                                gainDb = compressedDb - inputDb;
-                            }
-                            double targetGain = std::pow(10.0, gainDb / 20.0);
-                            if (!std::isfinite(targetGain))
-                                targetGain = 1.0;
-                            double coeff = (targetGain < state.compressorGain) ? state.compressorAttackCoeff
-                                                                               : state.compressorReleaseCoeff;
-                            state.compressorGain = targetGain + coeff * (state.compressorGain - targetGain);
-                            if (!std::isfinite(state.compressorGain))
-                                state.compressorGain = 1.0;
-                            processedLeft *= state.compressorGain;
-                            processedRight *= state.compressorGain;
-                        }
-                        else
-                        {
-                            state.compressorGain = 1.0;
-                        }
-
-                        if (state.delayEnabled && state.delayEffect)
-                        {
-                            state.delayEffect->setMix(static_cast<float>(modulatedParams.delayMix));
-                            float delayLeft = static_cast<float>(processedLeft);
-                            float delayRight = static_cast<float>(processedRight);
-                            state.delayEffect->process(&delayLeft, &delayRight, 1);
-                            processedLeft = delayLeft;
-                            processedRight = delayRight;
-                        }
-
-                        double sidechainGain = 1.0;
-                        if (state.sidechain.enabled())
-                        {
-                            double sourceLevel = 0.0;
-                            int sourceTrackId = state.sidechain.sourceTrackId();
-                            if (sourceTrackId == trackInfo.id)
-                            {
-                                sourceLevel = state.sidechain.detectorLevel();
-                            }
-                            else
-                            {
-                                auto sourceIt = playbackStates.find(sourceTrackId);
-                                if (sourceIt != playbackStates.end())
-                                {
-                                    sourceLevel = sourceIt->second.sidechain.detectorLevel();
-                                }
-                            }
-                            sidechainGain = state.sidechain.computeGain(sourceLevel, sampleRate);
-                        }
-                        else
-                        {
-                            state.sidechain.resetEnvelope();
-                        }
-
-                        processedLeft *= sidechainGain;
-                        processedRight *= sidechainGain;
+                        state.spectrumTrack=trackInfo.id;
+                        int fxOffset = 0;
+#ifdef KJ_ENABLE_VST3
+                        fxOffset = kj::trackVst3FrameOffset(trackInfo.id);
+#endif
+                        double sourceLevel = 0;
+                        auto source = playbackStates.find(state.sidechain.sourceTrackId());
+                        if (source != playbackStates.end()) sourceLevel = source->second.sidechain.detectorLevel();
+                        state.nativeFxFrames[fxOffset] = {modulatedParams.compressorThreshold, modulatedParams.compressorRatio,
+                            modulatedParams.delayMix, sourceLevel, sampleRate};
+#ifdef KJ_ENABLE_VST3
+                        kj::renderTrackVst3(trackInfo.id, trackInfo.type == TrackType::Vst3, sampleRate, transportSamplePosition,
+                            bpm, trackInfo.type==TrackType::AudioIn?false:transportRestarted, gate, noteAdvanced, noteOnNotes, notesPresent,
+                            processedLeft, processedRight, &trackInfo.fxOrder, processNativeRackEffect, &state,
+                            trackIndex < assignmentsByTrack.size() ? &assignmentsByTrack[trackIndex].second : nullptr,
+                            state.modulation.sourceValues.data(), state.modulation.sourceValues.size(), playing);
+#else
+                        for (const auto& key : trackInfo.fxOrder) processNativeRackEffect(&state, key, 0, processedLeft, processedRight);
+#endif
 
                         double combinedPan = std::clamp(modulatedParams.pan + state.stepPan, -1.0, 1.0);
                         double panAmount = std::clamp((combinedPan + 1.0) * 0.5, 0.0, 1.0);
                         double leftPanGain = std::cos(panAmount * (kPi * 0.5));
                         double rightPanGain = std::sin(panAmount * (kPi * 0.5));
-                        double volumeGain = std::clamp(modulatedParams.volume, 0.0, 1.0) * state.stepVelocity;
+                        double volumeGain = std::clamp(modulatedParams.volume, 0.0, 1.0) *
+                            (trackInfo.type == TrackType::Sample ? 1.0 : state.stepVelocity);
 
                         double finalLeft = processedLeft * volumeGain * leftPanGain;
                         double finalRight = processedRight * volumeGain * rightPanGain;
 
+                        if(!trackAudible(trackInfo,anySolo)||(trackInfo.type==TrackType::AudioIn&&(!trackInfo.inputMonitor||!state.inputReader.ready(trackInfo.inputChannel,trackInfo.inputStereo))))finalLeft=finalRight=0;
+                        state.peakLeft=std::max(state.peakLeft,std::abs(finalLeft));state.peakRight=std::max(state.peakRight,std::abs(finalRight));
                         leftValue += finalLeft;
                         rightValue += finalRight;
 
@@ -2866,6 +2813,8 @@ void audioLoop() {
                         sequencerCurrentStep.store(0, std::memory_order_relaxed);
                     }
 
+                    masterPeakLeft=std::max(masterPeakLeft,std::abs(leftValue));masterPeakRight=std::max(masterPeakRight,std::abs(rightValue));
+                    outputClipped |= std::abs(leftValue)>1.0 || std::abs(rightValue)>1.0;
                     leftValue = std::clamp(leftValue, -1.0, 1.0);
                     rightValue = std::clamp(rightValue, -1.0, 1.0);
 
@@ -2892,8 +2841,11 @@ void audioLoop() {
                 writeFrame(i, 0.0, 0.0);
             }
 
+            for(auto& item:playbackStates)if(item.second.meter)item.second.meter->publish(item.second.peakLeft,item.second.peakRight,available/sampleRate);
+            meter::master().publish(masterPeakLeft,masterPeakRight,available/sampleRate);
             if (capturedCount > 0)
                 writeWaveformSamples(capturedSamples.data(), capturedCount);
+            if(outputClipped)lastOutputClip.store(GetTickCount64(),std::memory_order_relaxed);
 #ifdef DEBUG_AUDIO
             double averageAmplitude = (available > 0)
                 ? (mixSumAbs / (static_cast<double>(available) * 2.0))
@@ -2922,9 +2874,14 @@ void audioLoop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+#ifdef KJ_ENABLE_VST3
+    kj::stopTrackVst3Audio();
+    kj::setTrackVst3AudioActive(false);
+#endif
     cacheThreadRunning.store(false, std::memory_order_release);
     if (cacheUpdater.joinable())
         cacheUpdater.join();
+    input::shutdown();
 
     if (deviceHandler) {
         deviceHandler->stop();
@@ -2949,8 +2906,10 @@ void audioLoop() {
 
 #include "audio_engine_waveform.inl"
 
-void initAudio() {
-    auto defaultSample = findDefaultSamplePath();
+double getAudioSampleRate() { return vstDeviceSampleRate.load(std::memory_order_relaxed); }
+
+void initAudio(bool loadDefaultSample) {
+    auto defaultSample = loadDefaultSample ? findDefaultSamplePath() : std::filesystem::path{};
     if (!defaultSample.empty()) {
         SampleBuffer buffer;
         if (loadSampleFromFile(defaultSample, buffer)) {
@@ -2977,6 +2936,8 @@ void shutdownAudio() {
     audioSequencerReady.store(false, std::memory_order_release);
     isPlaying.store(false, std::memory_order_relaxed);
     if (audioThread.joinable()) audioThread.join();
+    std::wstring recordingError;
+    stopAudioRecording(recordingError);
     if (sequencerThread.joinable()) sequencerThread.join();
     shutdownMidiOutput();
 }

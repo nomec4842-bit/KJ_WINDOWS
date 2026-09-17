@@ -32,18 +32,16 @@ AudioOutputDevice getActiveAudioOutputDevice() {
 }
 
 std::wstring getRequestedAudioOutputDeviceId() {
-    int index = gRequestedDeviceIndex.load(std::memory_order_acquire);
-    return gRequestedDeviceIds[index];
+    std::lock_guard<std::mutex> lock(gDeviceStateMutex);
+    return gRequestedDeviceId;
 }
 
 bool setActiveAudioOutputDevice(const std::wstring& deviceId) {
-    const auto& snapshot = getDeviceSnapshot();
-    if (deviceId == snapshot.activeId || deviceId == snapshot.requestedId)
-        return false;
-
-    int nextIndex = gRequestedDeviceIndex.load(std::memory_order_relaxed) ^ 1;
-    gRequestedDeviceIds[nextIndex] = deviceId;
-    gRequestedDeviceIndex.store(nextIndex, std::memory_order_release);
-    deviceChangeRequested.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(gDeviceStateMutex);
+    // Compare with the latest request, not the last completed device change.
+    // Selecting A -> B -> A before B opens must cancel the pending switch.
+    if(deviceId==gRequestedDeviceId)return false;
+    gRequestedDeviceId=deviceId;
+    deviceChangeRequested.store(true,std::memory_order_release);
     return true;
 }

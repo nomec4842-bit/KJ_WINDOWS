@@ -1,4 +1,5 @@
 #include "core/tracks.h"
+#include "core/track_type_sample.h"
 #include "core/tracks_internal.h"
 #include "core/audio_engine.h"
 
@@ -18,6 +19,13 @@ namespace track_internal
 
 std::vector<std::shared_ptr<TrackData>> gTracks;
 std::shared_mutex gTrackMutex;
+
+int clampTrackNote(const std::shared_ptr<TrackData>& track, int note)
+{
+    return track->type.load(std::memory_order_relaxed) == TrackType::Sample
+        ? std::max(0, note) : clampMidiNote(note);
+}
+
 int gNextTrackId = 1;
 
 std::shared_ptr<TrackData> makeTrackData(const std::string& name)
@@ -32,7 +40,7 @@ std::shared_ptr<TrackData> makeTrackData(const std::string& name)
     baseTrack.lowGainDb = 0.0f;
     baseTrack.midGainDb = 0.0f;
     baseTrack.highGainDb = 0.0f;
-    baseTrack.eqEnabled = true;
+    baseTrack.eqEnabled = false;
     baseTrack.delayEnabled = false;
     baseTrack.delayTimeMs = kDefaultDelayTimeMs;
     baseTrack.delayFeedback = kDefaultDelayFeedback;
@@ -94,13 +102,38 @@ std::shared_ptr<TrackData> findTrackData(int trackId)
 } // namespace track_internal
 
 using namespace track_internal;
+#include "core/piano_pattern.h"
 
 void initTracks()
 {
+    piano::reset();
     std::unique_lock<std::shared_mutex> lock(gTrackMutex);
     gTracks.clear();
     gNextTrackId = 1;
     gTracks.push_back(makeTrackData({}));
+}
+
+kj::Vst3RackState trackGetVst3State(int id) {
+    std::shared_lock<std::shared_mutex> lock(track_internal::gTrackMutex);
+    for (const auto& track : track_internal::gTracks) if (track->track.id == id) return track->vst3;
+    return {};
+}
+std::vector<std::string> trackGetFxOrder(int id) {
+    std::shared_lock<std::shared_mutex> lock(track_internal::gTrackMutex);
+    for (const auto& track : track_internal::gTracks) if (track->track.id == id) return track->track.fxOrder;
+    return {};
+}
+void trackSetFxOrder(int id, std::vector<std::string> order) {
+    std::vector<std::string> unique;
+    for (auto& key : order) if (!key.empty() && std::find(unique.begin(), unique.end(), key) == unique.end()) unique.push_back(std::move(key));
+    std::unique_lock<std::shared_mutex> lock(track_internal::gTrackMutex);
+    for (auto& track : track_internal::gTracks) if (track->track.id == id) { track->track.fxOrder = std::move(unique); return; }
+}
+void trackSetVst3State(int id, kj::Vst3RackState state) {
+    std::unique_lock<std::shared_mutex> lock(track_internal::gTrackMutex);
+    for (auto& track : track_internal::gTracks) if (track->track.id == id) {
+        track->vst3 = std::move(state); return;
+    }
 }
 
 Track addTrack(const std::string& name)
@@ -143,6 +176,11 @@ std::vector<Track> getTracks()
         info.midGainDb = track->midGainDb.load(std::memory_order_relaxed);
         info.highGainDb = track->highGainDb.load(std::memory_order_relaxed);
         info.eqEnabled = track->eqEnabled.load(std::memory_order_relaxed);
+        for (size_t band = 0; band < 3; ++band) {
+            info.eqShape[band] = track->eqShape[band].load(std::memory_order_relaxed);
+            info.eqFrequency[band] = track->eqFrequency[band].load(std::memory_order_relaxed);
+            info.eqQ[band] = track->eqQ[band].load(std::memory_order_relaxed);
+        }
         info.delayEnabled = track->delayEnabled.load(std::memory_order_relaxed);
         info.delayTimeMs = track->delayTimeMs.load(std::memory_order_relaxed);
         info.delayFeedback = track->delayFeedback.load(std::memory_order_relaxed);
@@ -181,6 +219,8 @@ std::vector<Track> getTracks()
             info.synthOscillators[oscIndex].release = track->synthOscRelease[oscIndex].load(std::memory_order_relaxed);
             info.synthOscillators[oscIndex].wavetableEnabled =
                 track->synthOscWavetableEnabled[oscIndex].load(std::memory_order_relaxed);
+            info.synthOscillators[oscIndex].wavetablePosition = track->synthOscWavetablePosition[oscIndex].load(std::memory_order_relaxed);
+            info.synthOscillators[oscIndex].wavetableMix = track->synthOscWavetableMix[oscIndex].load(std::memory_order_relaxed);
         }
         info.sampleAttack = track->sampleAttack.load(std::memory_order_relaxed);
         info.sampleRelease = track->sampleRelease.load(std::memory_order_relaxed);
@@ -191,10 +231,10 @@ std::vector<Track> getTracks()
             info.lfoSettings[i].deform = track->lfoDeform[i].load(std::memory_order_relaxed);
         }
         info.midiChannel = track->midiChannel.load(std::memory_order_relaxed);
-        info.midiPort = track->midiPort.load(std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(track->midiPortMutex);
             info.midiPortName = track->midiPortName;
+            info.midiPort = track->midiPort.load(std::memory_order_relaxed);
         }
         result.push_back(std::move(info));
     }
@@ -264,7 +304,14 @@ void trackSetStepState(int trackId, int stepIndex, bool enabled)
         {
             int note = track->notes[stepIndex].load(std::memory_order_relaxed);
             TrackData::StepNoteEntry entry{};
-            entry.midiNote = clampMidiNote(note);
+            if (track->type.load(std::memory_order_relaxed) == TrackType::Sample)
+            {
+                bool drum = track->sampleDrumMode.load(std::memory_order_relaxed);
+                entry.midiNote = drum ? std::max(kSampleDrumNoteBase, note)
+                                     : (note < kSampleDrumNoteBase ? note : kSampleRootNote);
+            }
+            else
+                entry.midiNote = clampMidiNote(note);
             entry.velocity = track->stepVelocity[stepIndex].load(std::memory_order_relaxed);
             entry.sustain = false;
             notes.push_back(entry);
@@ -313,7 +360,7 @@ int trackGetStepNote(int trackId, int stepIndex)
             note = notes.front().midiNote;
         }
     }
-    return clampMidiNote(note);
+    return clampTrackNote(track, note);
 }
 
 void trackSetStepNote(int trackId, int stepIndex, int midiNote)
@@ -329,7 +376,7 @@ void trackSetStepNote(int trackId, int stepIndex, int midiNote)
     if (stepIndex >= stepCount)
         return;
 
-    int clamped = clampMidiNote(midiNote);
+    int clamped = clampTrackNote(track, midiNote);
     track->notes[stepIndex].store(clamped, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(track->noteMutex);
@@ -364,15 +411,15 @@ std::vector<int> trackGetStepNotes(int trackId, int stepIndex)
         result.reserve(entries.size());
         for (const auto& entry : entries)
         {
-            int clamped = clampMidiNote(entry.midiNote);
-            if (clamped >= kMinMidiNote && clamped <= kMaxMidiNote)
+            int clamped = clampTrackNote(track, entry.midiNote);
+            if (clamped >= kMinMidiNote)
             {
                 result.push_back(clamped);
             }
         }
     }
     result.erase(std::remove_if(result.begin(), result.end(), [](int value) {
-        return value < kMinMidiNote || value > kMaxMidiNote;
+        return value < kMinMidiNote;
     }), result.end());
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
@@ -392,7 +439,7 @@ void trackToggleStepNote(int trackId, int stepIndex, int midiNote)
     if (stepIndex >= stepCount)
         return;
 
-    int clamped = clampMidiNote(midiNote);
+    int clamped = clampTrackNote(track, midiNote);
     {
         std::lock_guard<std::mutex> lock(track->noteMutex);
         auto& notes = track->stepNotes[stepIndex];
@@ -475,7 +522,7 @@ float trackGetStepNoteVelocity(int trackId, int stepIndex, int midiNote)
     if (stepIndex >= stepCount)
         return kTrackStepVelocityMax;
 
-    int clampedNote = clampMidiNote(midiNote);
+    int clampedNote = clampTrackNote(track, midiNote);
     float fallback = track->stepVelocity[stepIndex].load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(track->noteMutex);
     const auto& notes = track->stepNotes[stepIndex];
@@ -509,10 +556,10 @@ std::vector<StepNoteInfo> trackGetStepNoteInfo(int trackId, int stepIndex)
     for (const auto& entry : notes)
     {
         StepNoteInfo info{};
-        info.midiNote = clampMidiNote(entry.midiNote);
+        info.midiNote = clampTrackNote(track, entry.midiNote);
         info.velocity = std::clamp(entry.velocity, kTrackStepVelocityMin, kTrackStepVelocityMax);
         info.sustain = entry.sustain;
-        if (info.midiNote >= kMinMidiNote && info.midiNote <= kMaxMidiNote)
+        if (info.midiNote >= kMinMidiNote)
         {
             result.push_back(info);
         }
@@ -543,7 +590,7 @@ bool trackGetStepNoteSustain(int trackId, int stepIndex, int midiNote)
     if (stepIndex >= stepCount)
         return false;
 
-    int clampedNote = clampMidiNote(midiNote);
+    int clampedNote = clampTrackNote(track, midiNote);
     std::lock_guard<std::mutex> lock(track->noteMutex);
     const auto& notes = track->stepNotes[stepIndex];
     auto it = std::find_if(notes.begin(), notes.end(), [clampedNote](const TrackData::StepNoteEntry& entry) {
@@ -567,7 +614,7 @@ void trackSetStepNoteSustain(int trackId, int stepIndex, int midiNote, bool sust
     if (stepIndex >= stepCount)
         return;
 
-    int clampedNote = clampMidiNote(midiNote);
+    int clampedNote = clampTrackNote(track, midiNote);
     std::lock_guard<std::mutex> lock(track->noteMutex);
     auto& notes = track->stepNotes[stepIndex];
     auto it = std::find_if(notes.begin(), notes.end(), [clampedNote](const TrackData::StepNoteEntry& entry) {
@@ -592,7 +639,7 @@ void trackSetStepNoteVelocity(int trackId, int stepIndex, int midiNote, float va
     if (stepIndex >= stepCount)
         return;
 
-    int clampedNote = clampMidiNote(midiNote);
+    int clampedNote = clampTrackNote(track, midiNote);
     float clampedValue = std::clamp(value, kTrackStepVelocityMin, kTrackStepVelocityMax);
     std::lock_guard<std::mutex> lock(track->noteMutex);
     auto& notes = track->stepNotes[stepIndex];
@@ -720,6 +767,7 @@ void trackSetType(int trackId, TrackType type)
     {
         if (track->track.id == trackId)
         {
+            if(track->track.type!=type)track->track.inputMonitor=false;
             track->type.store(type, std::memory_order_relaxed);
             track->track.type = type;
 
@@ -768,6 +816,35 @@ void trackSetPan(int trackId, float pan)
     track->pan.store(clamped, std::memory_order_relaxed);
 }
 
+float trackGetEqFrequency(int trackId, int band) {
+    auto track = findTrackData(trackId);
+    if (!track || band < 0 || band >= 3) return 1000.0f;
+    return track->eqFrequency[band].load(std::memory_order_relaxed);
+}
+void trackSetEqFrequency(int trackId, int band, float value) {
+    auto track = findTrackData(trackId);
+    if (!track || band < 0 || band >= 3 || !std::isfinite(value)) return;
+    track->eqFrequency[band].store(std::clamp(value, 20.0f, 20000.0f), std::memory_order_relaxed);
+}
+int trackGetEqShape(int trackId,int band) {
+    auto track=findTrackData(trackId);if(!track||band<0||band>=3)return 0;
+    return track->eqShape[band].load(std::memory_order_relaxed);
+}
+void trackSetEqShape(int trackId,int band,int shape) {
+    auto track=findTrackData(trackId);if(!track||band<0||band>=3)return;
+    track->eqShape[band].store(std::clamp(shape,0,6),std::memory_order_relaxed);
+}
+float trackGetEqQ(int trackId, int band) {
+    auto track = findTrackData(trackId);
+    if (!track || band < 0 || band >= 3) return 0.707f;
+    return track->eqQ[band].load(std::memory_order_relaxed);
+}
+void trackSetEqQ(int trackId, int band, float value) {
+    auto track = findTrackData(trackId);
+    if (!track || band < 0 || band >= 3 || !std::isfinite(value)) return;
+    track->eqQ[band].store(std::clamp(value, 0.1f, 10.0f), std::memory_order_relaxed);
+}
+
 float trackGetEqLowGain(int trackId)
 {
     auto track = findTrackData(trackId);
@@ -810,7 +887,7 @@ bool trackGetEqEnabled(int trackId)
 void trackSetEqLowGain(int trackId, float gainDb)
 {
     auto track = findTrackData(trackId);
-    if (!track)
+    if (!track || !std::isfinite(gainDb))
         return;
 
     float clamped = std::clamp(gainDb, kMinEqGainDb, kMaxEqGainDb);
@@ -820,7 +897,7 @@ void trackSetEqLowGain(int trackId, float gainDb)
 void trackSetEqMidGain(int trackId, float gainDb)
 {
     auto track = findTrackData(trackId);
-    if (!track)
+    if (!track || !std::isfinite(gainDb))
         return;
 
     float clamped = std::clamp(gainDb, kMinEqGainDb, kMaxEqGainDb);
@@ -830,7 +907,7 @@ void trackSetEqMidGain(int trackId, float gainDb)
 void trackSetEqHighGain(int trackId, float gainDb)
 {
     auto track = findTrackData(trackId);
-    if (!track)
+    if (!track || !std::isfinite(gainDb))
         return;
 
     float clamped = std::clamp(gainDb, kMinEqGainDb, kMaxEqGainDb);
@@ -844,6 +921,11 @@ void trackSetEqEnabled(int trackId, bool enabled)
         return;
 
     track->eqEnabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) {
+        std::unique_lock<std::shared_mutex> lock(gTrackMutex);
+        auto& order = track->track.fxOrder;
+        if (std::find(order.begin(), order.end(), "kj:eq") == order.end()) order.push_back("kj:eq");
+    }
 }
 
 bool trackGetDelayEnabled(int trackId)
@@ -862,6 +944,11 @@ void trackSetDelayEnabled(int trackId, bool enabled)
         return;
 
     track->delayEnabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) {
+        std::unique_lock<std::shared_mutex> lock(gTrackMutex);
+        auto& order = track->track.fxOrder;
+        if (std::find(order.begin(), order.end(), "kj:delay") == order.end()) order.push_back("kj:delay");
+    }
 }
 
 float trackGetDelayTimeMs(int trackId)
@@ -940,6 +1027,11 @@ void trackSetCompressorEnabled(int trackId, bool enabled)
         return;
 
     track->compressorEnabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) {
+        std::unique_lock<std::shared_mutex> lock(gTrackMutex);
+        auto& order = track->track.fxOrder;
+        if (std::find(order.begin(), order.end(), "kj:compressor") == order.end()) order.push_back("kj:compressor");
+    }
 }
 
 float trackGetCompressorThresholdDb(int trackId)
@@ -1038,6 +1130,11 @@ void trackSetSidechainEnabled(int trackId, bool enabled)
         return;
 
     track->sidechainEnabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) {
+        std::unique_lock<std::shared_mutex> lock(gTrackMutex);
+        auto& order = track->track.fxOrder;
+        if (std::find(order.begin(), order.end(), "kj:sidechain") == order.end()) order.push_back("kj:sidechain");
+    }
 }
 
 int trackGetSidechainSourceTrack(int trackId)
@@ -1117,3 +1214,9 @@ void trackSetSidechainRelease(int trackId, float value)
     float clamped = std::clamp(value, kMinSynthEnvelopeTime, kMaxSynthEnvelopeTime);
     track->sidechainRelease.store(clamped, std::memory_order_relaxed);
 }
+
+void trackSetMute(int id,bool value){std::unique_lock<std::shared_mutex> lock(gTrackMutex);for(auto& t:gTracks)if(t->track.id==id)t->track.mute=value;}
+void trackSetSolo(int id,bool value){std::unique_lock<std::shared_mutex> lock(gTrackMutex);for(auto& t:gTracks)if(t->track.id==id)t->track.solo=value;}
+void trackSetInputDevice(int id,std::string device,std::string name){std::unique_lock<std::shared_mutex> lock(gTrackMutex);for(auto& t:gTracks)if(t->track.id==id){t->track.inputDeviceId=std::move(device);t->track.inputDeviceName=std::move(name);t->track.inputMonitor=false;t->track.inputChannel=0;t->track.inputStereo=false;return;}}
+void trackSetInputChannels(int id,int first,bool stereo){if(first<0||first>=64)return;std::unique_lock<std::shared_mutex> lock(gTrackMutex);for(auto& t:gTracks)if(t->track.id==id){t->track.inputChannel=first;t->track.inputStereo=stereo;}}
+void trackSetInputMonitor(int id,bool value){std::unique_lock<std::shared_mutex> lock(gTrackMutex);for(auto& t:gTracks)if(t->track.id==id)t->track.inputMonitor=value&&!t->track.inputDeviceId.empty();}

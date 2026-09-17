@@ -86,6 +86,7 @@ public:
     static std::vector<DeviceInfo> enumerateRenderDevices();
 
 private:
+    friend struct AudioDeviceInitializationTest;
     struct FormatDeleter {
         void operator()(WAVEFORMATEX* format) const;
     };
@@ -105,6 +106,7 @@ private:
     std::unique_ptr<WAVEFORMATEX, FormatDeleter> mixFormat_;
     UINT32 bufferFrameCount_ = 0;
     bool initialized_ = false;
+    std::wstring requestedDeviceId_; // Empty selects System Default, even after resolution.
     std::wstring deviceId_;
     std::wstring deviceName_;
     BYTE* activeRenderBuffer_ = nullptr;

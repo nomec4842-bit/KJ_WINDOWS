@@ -24,3 +24,8 @@ bool isModMatrixWindowOpen();
 void notifyModMatrixWindowTrackListChanged();
 void notifyModMatrixWindowValuesChanged(int trackId);
 void focusModMatrixTarget(ModMatrixParameter parameter, int trackId);
+
+// Handles tab navigation and amount edit shortcuts for this modeless window.
+bool handleModMatrixKeyboard(MSG* message);
+HWND createModMatrixView(HWND parent);
+void bindModMatrixView(int trackId);

@@ -10,10 +10,15 @@
 #include <mmsystem.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
 
+#ifdef KJ_BUILD_TESTS
+static std::atomic<void(*)(int,uint32_t)> midiTestObserver{nullptr};
+void setMidiTestObserver(void(*observer)(int,uint32_t)){midiTestObserver=observer;}
+#endif
 namespace
 {
     std::mutex gMidiMutex;
@@ -39,6 +44,9 @@ namespace
 
     void sendShortMessage(int portId, DWORD message)
     {
+#ifdef KJ_BUILD_TESTS
+        if(auto observer=midiTestObserver.load()){observer(portId,message);return;}
+#endif
         if (portId < 0)
             return;
 

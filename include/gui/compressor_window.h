@@ -15,3 +15,4 @@ void openCompressorWindow(HWND parent, int trackId);
 void notifyCompressorWindowTrackChanged(int trackId);
 void notifyCompressorWindowValuesChanged(int trackId);
 void closeCompressorWindow();
+HWND createCompressorView(HWND parent, int trackId);
