@@ -569,6 +569,15 @@ void openCompressorWindow(HWND parent, int trackId)
     }
 }
 
+HWND createCompressorView(HWND parent, int trackId)
+{
+    registerCompressorWindowClass();
+    HWND view=CreateWindowExW(WS_EX_CONTROLPARENT,kCompressorWindowClassName,L"Compressor",
+        WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN,0,0,520,360,parent,nullptr,GetModuleHandle(nullptr),nullptr);
+    SendMessageW(view,WM_COMPRESSOR_SET_TRACK,trackId,0);
+    return view;
+}
+
 void notifyCompressorWindowTrackChanged(int trackId)
 {
     if (gCompressorWindow && IsWindow(gCompressorWindow))
@@ -590,4 +599,3 @@ void closeCompressorWindow()
     if (gCompressorWindow && IsWindow(gCompressorWindow))
         DestroyWindow(gCompressorWindow);
 }
-

@@ -1,9 +1,12 @@
 #pragma once
+#include "core/lfo_config.h"
+#include "core/vst3_state.h"
 
 #include <array>
 #include <cstddef>
 #include <string>
 #include <vector>
+#include <map>
 
 struct SampleBuffer;
 
@@ -16,6 +19,8 @@ enum class TrackType
     Synth,
     Sample,
     MidiOut,
+    Vst3,
+    AudioIn,
 };
 
 enum class SynthWaveType
@@ -55,10 +60,24 @@ struct SynthOscillatorSettings
     float sustain = 0.8f;
     float release = 0.3f;
     bool wavetableEnabled = false;
+    float wavetablePosition = 0.0f;
+    float wavetableMix = 1.0f;
 };
+
+struct DrumSettings { float attack=.005f, release=.3f, pitch=0, pan=0, volume=1; };
 
 struct Track
 {
+    std::map<int,DrumSettings> drums; // Zero-based sample bank lane; omitted lanes inherit track AR.
+    int selectedDrum=0;
+    bool mute=false, solo=false;
+    std::string inputDeviceId, inputDeviceName;
+    int inputChannel=0;
+    bool inputStereo=false, inputMonitor=false;
+
+    // Native effects retain their existing per-track controls and DSP state.
+    // Plugin entries use their stable slot IDs in this shared signal order.
+    std::vector<std::string> fxOrder;
     int id;
     std::string name;
     TrackType type = TrackType::Synth;
@@ -68,7 +87,10 @@ struct Track
     float lowGainDb = 0.0f;
     float midGainDb = 0.0f;
     float highGainDb = 0.0f;
-    bool eqEnabled = true;
+    bool eqEnabled = false;
+    std::array<float, 3> eqFrequency{{200.0f, 1000.0f, 5000.0f}};
+    std::array<int, 3> eqShape{{1, 0, 0}}; // New EQs use a broad bass shelf; project loading preserves saved shapes.
+    std::array<float, 3> eqQ{{0.707f, 0.707f, 0.707f}};
     bool delayEnabled = false;
     float delayTimeMs = 350.0f;
     float delayFeedback = 0.35f;
@@ -97,7 +119,7 @@ struct Track
     std::array<SynthOscillatorSettings, kSynthOscillatorCount> synthOscillators{};
     float sampleAttack = 0.005f;
     float sampleRelease = 0.3f;
-    std::array<LfoSettings, 3> lfoSettings{};
+    std::array<LfoSettings, kMaxLfos> lfoSettings{};
     int midiChannel = 1;
     int midiPort = -1;
     std::wstring midiPortName;
@@ -118,6 +140,10 @@ struct StepNoteInfo
 };
 
 void initTracks();
+std::vector<std::string> trackGetFxOrder(int trackId);
+void trackSetFxOrder(int trackId, std::vector<std::string> order);
+kj::Vst3RackState trackGetVst3State(int trackId);
+void trackSetVst3State(int trackId, kj::Vst3RackState state);
 Track addTrack(const std::string& name = {});
 std::vector<Track> getTracks();
 size_t getTrackCount();
@@ -134,6 +160,12 @@ float trackGetPan(int trackId);
 void trackSetPan(int trackId, float pan);
 
 float trackGetEqLowGain(int trackId);
+float trackGetEqFrequency(int trackId, int band);
+void trackSetEqFrequency(int trackId, int band, float value);
+int trackGetEqShape(int trackId, int band);
+void trackSetEqShape(int trackId, int band, int shape);
+float trackGetEqQ(int trackId, int band);
+void trackSetEqQ(int trackId, int band, float value);
 float trackGetEqMidGain(int trackId);
 float trackGetEqHighGain(int trackId);
 
@@ -211,3 +243,10 @@ void trackSetStepPan(int trackId, int stepIndex, float value);
 
 float trackGetStepPitchOffset(int trackId, int stepIndex);
 void trackSetStepPitchOffset(int trackId, int stepIndex, float value);
+
+void trackSetMute(int trackId,bool value);
+void trackSetSolo(int trackId,bool value);
+void trackSetInputDevice(int trackId,std::string id,std::string name);
+void trackSetInputChannels(int trackId,int first,bool stereo);
+void trackSetInputMonitor(int trackId,bool enabled);
+inline bool trackAudible(const Track& track,bool anySolo){return !track.mute && (!anySolo || track.solo);}

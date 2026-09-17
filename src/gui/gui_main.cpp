@@ -1,6 +1,17 @@
+#include "gui/mixer.h"
 #include "gui/gui_main.h"
 #include "core/audio_engine.h"
+#ifdef KJ_ENABLE_VST3
+#include "gui/vst3_menu.h"
+#include "hosting/TrackVST3.h"
+#endif
+#include "core/audio_recording.h"
+#include "gui/piano_editor.h"
+#include "gui/eq_graph.h"
+#include "core/parametric_eq.h"
 #include "core/project_io.h"
+#include "gui/editing_panel.h"
+#include "core/sample_loader.h"
 #include "core/sequencer.h"
 #include "core/midi_ports.h"
 #include "core/tracks.h"
@@ -175,7 +186,11 @@ constexpr int kAudioDeviceDropdownOptionHeight = 24;
 constexpr int kWaveDropdownSpacing = 4;
 constexpr int kWaveDropdownOptionHeight = 24;
 
-const std::array<TrackType, 3> kTrackTypeOptions = {TrackType::MidiOut, TrackType::Sample, TrackType::Synth};
+#ifdef KJ_ENABLE_VST3
+const std::array<TrackType, 5> kTrackTypeOptions = {TrackType::MidiOut, TrackType::Sample, TrackType::Synth, TrackType::Vst3, TrackType::AudioIn};
+#else
+const std::array<TrackType, 4> kTrackTypeOptions = {TrackType::MidiOut, TrackType::Sample, TrackType::Synth, TrackType::AudioIn};
+#endif
 const std::array<SynthWaveType, 4> kSynthWaveOptions = {SynthWaveType::Sine, SynthWaveType::Square,
                                                         SynthWaveType::Saw, SynthWaveType::Triangle};
 
@@ -213,8 +228,42 @@ RECT loadSampleButton = {200, 40, 340, 110};
 RECT waveSelectButton = {200, 40, 340, 110};
 RECT midiPortButton = {200, 40, 340, 75};
 RECT midiChannelButton = {200, 80, 340, 110};
-RECT bpmDownButton = {360, 55, 400, 95};
-RECT bpmUpButton = {410, 55, 450, 95};
+HWND gTempoEdit = nullptr;
+HWND gTempoSpin = nullptr;
+constexpr int kTempoEditId = 5101;
+constexpr int kTempoSpinId = 5102;
+
+void syncTempoControl()
+{
+    if (!gTempoEdit) return;
+    std::wstring text = std::to_wstring(sequencerBPM.load(std::memory_order_relaxed));
+    SetWindowTextW(gTempoEdit, text.c_str());
+}
+
+void commitTempoControl()
+{
+    wchar_t text[32]{};
+    GetWindowTextW(gTempoEdit, text, 32);
+    wchar_t* end = nullptr;
+    long value = wcstol(text, &end, 10);
+    if (end != text && *end == 0)
+        sequencerBPM.store(static_cast<int>(std::clamp(value, 40L, 240L)), std::memory_order_relaxed);
+    syncTempoControl();
+}
+
+LRESULT CALLBACK TempoEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR)
+{
+    if (msg == WM_KEYDOWN && (wParam == VK_RETURN || wParam == VK_ESCAPE)) {
+        if (wParam == VK_RETURN) commitTempoControl();
+        else syncTempoControl();
+        SetFocus(GetParent(hwnd));
+        return 0;
+    }
+    if (msg == WM_CHAR && (wParam == VK_RETURN || wParam == VK_ESCAPE)) return 0;
+    if (msg == WM_KILLFOCUS) commitTempoControl();
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, TempoEditProc, 1);
+    return DefSubclassProc(hwnd, msg, wParam, lParam);
+}
 RECT stepCountDownButton = {470, 55, 510, 95};
 RECT stepCountUpButton = {520, 55, 560, 95};
 RECT pageDownButton = {580, 55, 620, 95};
@@ -261,6 +310,7 @@ void snapParamWindowsToMain();
 
 constexpr UINT kMenuCommandLoadProject = 1001;
 constexpr UINT kMenuCommandSaveProject = 1002;
+constexpr UINT kMenuCommandRecord = 1007;
 
 struct PianoRollDragState
 {
@@ -294,16 +344,39 @@ constexpr UINT kPianoRollContextDeleteRangeId = 5002;
 constexpr UINT kParameterContextSetModTargetId = 5101;
 
 constexpr wchar_t kPianoRollWindowClassName[] = L"KJPianoRollWindow";
-constexpr int kPianoRollWindowWidth = 640;
-constexpr int kPianoRollWindowHeight = 360;
+constexpr int kPianoRollWindowWidth = 900;
+constexpr int kPianoRollWindowHeight = 600;
 constexpr int kPianoRollMargin = 10;
 constexpr int kPianoRollKeyboardWidth = 80;
 constexpr int kPianoRollMenuSpacing = 8;
 constexpr int kPianoRollMenuAreaHeight = 140;
 constexpr int kPianoRollTabBarHeight = 28;
 constexpr int kPianoRollNoteRows = 24;
+int gDrumRowOffset = 0;
+bool pianoRollDrumMode()
+{
+    int trackId = getActiveSequencerTrackId();
+    return trackGetType(trackId) == TrackType::Sample && trackGetSampleDrumMode(trackId);
+}
+int pianoRollVisibleRows()
+{
+    if (!pianoRollDrumMode())
+        return kPianoRollNoteRows;
+    auto bank = sampleGetBankBuffers();
+    return static_cast<int>(std::min<size_t>(8, std::max<size_t>(1, bank ? bank->size() : 0)));
+}
+int pianoRollRowNote(int row);
+std::wstring sampleDrumRowLabel(int row);
 constexpr int kPianoRollLowestNote = 48; // C3
 constexpr int kPianoRollHighestNote = kPianoRollLowestNote + kPianoRollNoteRows - 1;
+int pianoRollRowNote(int row)
+{
+    if (!pianoRollDrumMode())
+        return kPianoRollHighestNote - row;
+    auto bank = sampleGetBankBuffers();
+    size_t lane = static_cast<size_t>(gDrumRowOffset + row);
+    return bank && lane < bank->size() ? kSampleDrumNoteBase + static_cast<int>(lane) : -1;
+}
 constexpr COLORREF kPianoRollGridBackground = RGB(30, 30, 30);
 constexpr COLORREF kPianoRollGridLine = RGB(60, 60, 60);
 constexpr COLORREF kPianoRollActiveNote = RGB(0, 140, 220);
@@ -412,7 +485,7 @@ PianoRollLayout computePianoRollLayout(const RECT& client)
     if (gridBottom < innerTop)
         gridBottom = innerTop;
 
-    LONG keyboardRight = std::min(innerRight, innerLeft + kPianoRollKeyboardWidth);
+    LONG keyboardRight = std::min(innerRight, innerLeft + (pianoRollDrumMode() ? 180 : kPianoRollKeyboardWidth));
 
     layout.grid.left = keyboardRight;
     layout.grid.top = innerTop;
@@ -496,16 +569,16 @@ PianoRollLayout computePianoRollLayout(const RECT& client)
     }
     layout.columnX[kSequencerStepsPerPage] = layout.grid.right;
 
-    int baseRowHeight = kPianoRollNoteRows > 0 ? gridHeight / kPianoRollNoteRows : 0;
-    int rowRemainder = kPianoRollNoteRows > 0 ? gridHeight % kPianoRollNoteRows : 0;
+    int baseRowHeight = kPianoRollNoteRows > 0 ? gridHeight / pianoRollVisibleRows() : 0;
+    int rowRemainder = kPianoRollNoteRows > 0 ? gridHeight % pianoRollVisibleRows() : 0;
     int y = layout.grid.top;
-    for (int i = 0; i < kPianoRollNoteRows; ++i)
+    for (int i = 0; i < pianoRollVisibleRows(); ++i)
     {
         layout.rowY[i] = y;
         int increment = baseRowHeight + (i < rowRemainder ? 1 : 0);
         y += increment;
     }
-    layout.rowY[kPianoRollNoteRows] = layout.grid.bottom;
+    layout.rowY[pianoRollVisibleRows()] = layout.grid.bottom;
 
     return layout;
 }
@@ -572,6 +645,13 @@ std::vector<int> getStepNotesForDisplay(int trackId, int stepIndex)
         int fallback = trackGetStepNote(trackId, stepIndex);
         if (fallback >= 0)
             notes.push_back(fallback);
+    }
+    if (trackGetType(trackId) == TrackType::Sample)
+    {
+        bool drum = trackGetSampleDrumMode(trackId);
+        notes.erase(std::remove_if(notes.begin(), notes.end(), [drum](int note) {
+            return (note >= kSampleDrumNoteBase) != drum;
+        }), notes.end());
     }
     return notes;
 }
@@ -857,7 +937,10 @@ void pianoRollApplyMenuParameter(int parameterIndex,
 
         if (notes.size() == 1)
         {
-            trackSetStepVelocity(trackId, stepIndex, normalized);
+            if (trackGetType(trackId) == TrackType::Sample)
+                trackSetStepNoteVelocity(trackId, stepIndex, notes.front(), normalized);
+            else
+                trackSetStepVelocity(trackId, stepIndex, normalized);
             break;
         }
 
@@ -990,12 +1073,16 @@ SliderControlRects gSynthResonanceSliderControl{};
 SliderControlRects gSynthFeedbackSliderControl{};
 SliderControlRects gSynthPitchSliderControl{};
 SliderControlRects gSynthPitchRangeSliderControl{};
+SliderControlRects gSynthWavetablePositionSliderControl{};
+SliderControlRects gSynthWavetableMixSliderControl{};
 SliderControlRects gSynthAttackSliderControl{};
 SliderControlRects gSynthDecaySliderControl{};
 SliderControlRects gSynthSustainSliderControl{};
 SliderControlRects gSynthReleaseSliderControl{};
 SliderControlRects gSampleAttackSliderControl{};
 SliderControlRects gSampleReleaseSliderControl{};
+SliderControlRects gDrumPitchSliderControl{}, gDrumPanSliderControl{}, gDrumVolumeSliderControl{};
+int gSampleDragLane=-1;
 
 enum class SliderDragTarget
 {
@@ -1010,8 +1097,11 @@ enum class SliderDragTarget
     SynthSustain,
     SynthRelease,
     SynthWavetableToggle,
+    SynthWavetablePosition,
+    SynthWavetableMix,
     SampleAttack,
     SampleRelease,
+    DrumPitch, DrumPan, DrumVolume,
 };
 
 struct SliderDragState
@@ -1203,6 +1293,8 @@ void pruneSynthOscTabs(const std::vector<Track>& tracks);
 int ensureSelectedTrack(const std::vector<Track>& tracks)
 {
     int previousSelected = selectedTrackId;
+    int activeSelection=getActiveSequencerTrackId();
+    for(const auto& t:tracks)if(t.id==activeSelection)selectedTrackId=activeSelection;
 
     if (tracks.empty())
     {
@@ -1285,6 +1377,8 @@ void ensureTrackTabState(const std::vector<Track>& tracks)
     }
 
     int previousSelected = selectedTrackId;
+    int activeSelection=getActiveSequencerTrackId();
+    for(const auto& t:tracks)if(t.id==activeSelection)selectedTrackId=activeSelection;
     int ensuredTrackId = ensureSelectedTrack(tracks);
     bool selectionChanged = ensuredTrackId != previousSelected;
 
@@ -1393,6 +1487,10 @@ std::string trackTypeToString(TrackType type)
         return "MIDI Out";
     case TrackType::Synth:
         return "Synth";
+    case TrackType::Vst3:
+        return "VST3";
+    case TrackType::AudioIn:
+        return "Audio In";
     }
     return "Synth";
 }
@@ -1466,7 +1564,8 @@ void showLoadProjectDialog(HWND hwnd)
     if (GetOpenFileNameW(&ofn))
     {
         std::filesystem::path selectedPath(fileBuffer);
-        if (!loadProjectFromFile(selectedPath))
+        const bool loaded = loadProjectFromFile(selectedPath);
+        if (!loaded)
         {
             MessageBoxW(hwnd,
                         L"Failed to load project.",
@@ -1474,6 +1573,8 @@ void showLoadProjectDialog(HWND hwnd)
                         MB_OK | MB_ICONERROR);
             return;
         }
+
+        resetEditingPanelTracks();
 
         auto tracks = getTracks();
         if (!tracks.empty())
@@ -1553,8 +1654,21 @@ void showSaveProjectDialog(HWND hwnd)
 
 LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if (msg != WM_DESTROY) return PianoEditorWndProc(hwnd, msg, wParam, lParam);
     switch (msg)
     {
+    case WM_MOUSEWHEEL:
+        if (pianoRollDrumMode())
+        {
+            auto bank = sampleGetBankBuffers();
+            int maxOffset = bank ? std::max(0, static_cast<int>(bank->size()) - pianoRollVisibleRows()) : 0;
+            gDrumRowOffset = std::clamp(gDrumRowOffset - GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA * 3, 0, maxOffset);
+            pianoRollResetDrag();
+            pianoRollResetParamDrag();
+            if (GetCapture() == hwnd) ReleaseCapture();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
     case WM_CREATE:
         return 0;
     case WM_CLOSE:
@@ -1678,7 +1792,7 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             }
 
             int row = -1;
-            for (int i = 0; i < kPianoRollNoteRows; ++i)
+            for (int i = 0; i < pianoRollVisibleRows(); ++i)
             {
                 if (y >= layout.rowY[i] && y < layout.rowY[i + 1])
                 {
@@ -1699,7 +1813,8 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                     int stepIndex = currentStepPage * kSequencerStepsPerPage + column;
                     if (stepIndex < totalSteps)
                     {
-                        int midiNote = kPianoRollHighestNote - row;
+                        int midiNote = pianoRollRowNote(row);
+                        if (midiNote < 0) return 0;
                         std::vector<int> existingRange;
                         std::vector<int> fullRange;
                         bool notePresent = stepContainsMidiNote(trackId, stepIndex, midiNote);
@@ -1796,7 +1911,7 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         }
 
         int row = -1;
-        for (int i = 0; i < kPianoRollNoteRows; ++i)
+        for (int i = 0; i < pianoRollVisibleRows(); ++i)
         {
             if (y >= layout.rowY[i] && y < layout.rowY[i + 1])
             {
@@ -1819,7 +1934,8 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
         if (stepIndex >= totalSteps)
             return 0;
 
-        int midiNote = kPianoRollHighestNote - row;
+        int midiNote = pianoRollRowNote(row);
+                        if (midiNote < 0) return 0;
         if (!stepContainsMidiNote(trackId, stepIndex, midiNote))
             return 0;
 
@@ -1945,7 +2061,7 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                     }
 
                     int row = -1;
-                    for (int i = 0; i < kPianoRollNoteRows; ++i)
+                    for (int i = 0; i < pianoRollVisibleRows(); ++i)
                     {
                         if (y >= layout.rowY[i] && y < layout.rowY[i + 1])
                         {
@@ -1967,7 +2083,8 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                             int stepIndex = baseStep + column;
                             if (stepIndex >= 0 && stepIndex < totalSteps)
                             {
-                                int midiNote = kPianoRollHighestNote - row;
+                                int midiNote = pianoRollRowNote(row);
+                        if (midiNote < 0) return 0;
                                 if (stepContainsMidiNote(trackId, stepIndex, midiNote))
                                 {
                                     PianoRollNoteRange range = pianoRollComputeNoteRange(trackId, stepIndex, midiNote, totalSteps);
@@ -2045,9 +2162,6 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
     }
     case WM_LBUTTONUP:
     {
-        if (GetCapture() == hwnd)
-            ReleaseCapture();
-
         if (gPianoRollParamDrag.active)
         {
             pianoRollResetParamDrag();
@@ -2085,8 +2199,21 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                 InvalidateRect(gMainWindow, nullptr, FALSE);
             }
         }
+        // Release only after committing and clearing the drag: capture loss is synchronous.
+        if (GetCapture() == hwnd)
+            ReleaseCapture();
         return 0;
     }
+    case WM_CANCELMODE:
+        pianoRollResetDrag();
+        pianoRollResetParamDrag();
+        if (GetCapture() == hwnd)
+            ReleaseCapture();
+        return 0;
+    case WM_CAPTURECHANGED:
+        pianoRollResetDrag();
+        pianoRollResetParamDrag();
+        return 0;
     case WM_PAINT:
     {
         PAINTSTRUCT ps;
@@ -2154,9 +2281,10 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
                 columnNotes[column] = getStepNotesForDisplay(trackId, stepIndex);
             }
 
-            for (int row = 0; row < kPianoRollNoteRows; ++row)
+            for (int row = 0; row < pianoRollVisibleRows(); ++row)
             {
-                int midiNote = kPianoRollHighestNote - row;
+                int midiNote = pianoRollRowNote(row);
+                if (midiNote < 0) continue;
                 int column = 0;
                 while (column < kSequencerStepsPerPage)
                 {
@@ -2205,24 +2333,25 @@ LRESULT CALLBACK PianoRollWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPa
             }
         }
 
-        for (int row = 0; row < kPianoRollNoteRows; ++row)
+        for (int row = 0; row < pianoRollVisibleRows(); ++row)
         {
-            int midiNote = kPianoRollHighestNote - row;
+            int midiNote = pianoRollRowNote(row);
+                if (midiNote < 0) continue;
             RECT keyRect {layout.keyboard.left, layout.rowY[row], layout.keyboard.right, layout.rowY[row + 1]};
-            COLORREF keyColor = midiNoteIsBlack(midiNote) ? kPianoRollKeyboardDark : kPianoRollKeyboardLight;
+            COLORREF keyColor = !pianoRollDrumMode() && midiNoteIsBlack(midiNote) ? kPianoRollKeyboardDark : kPianoRollKeyboardLight;
             HBRUSH keyBrush = CreateSolidBrush(keyColor);
             FillRect(hdc, &keyRect, keyBrush);
             DeleteObject(keyBrush);
 
             RECT labelRect = keyRect;
             labelRect.left += 6;
-            std::wstring label = midiNoteToLabel(midiNote);
-            DrawTextW(hdc, label.c_str(), -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            std::wstring label = pianoRollDrumMode() ? sampleDrumRowLabel(row) : midiNoteToLabel(midiNote);
+            DrawTextW(hdc, label.c_str(), -1, &labelRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
 
         HPEN gridPen = CreatePen(PS_SOLID, 1, kPianoRollGridLine);
         HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, gridPen));
-        for (int row = 0; row <= kPianoRollNoteRows; ++row)
+        for (int row = 0; row <= pianoRollVisibleRows(); ++row)
         {
             MoveToEx(hdc, layout.grid.left, layout.rowY[row], nullptr);
             LineTo(hdc, layout.grid.right, layout.rowY[row]);
@@ -2558,6 +2687,7 @@ void ensurePianoRollWindowClass()
 
 void togglePianoRollWindow(HWND parent)
 {
+    if(trackGetType(getActiveSequencerTrackId())==TrackType::AudioIn)return;
     if (gPianoRollWindow && IsWindow(gPianoRollWindow))
     {
         closePianoRollWindow();
@@ -3606,6 +3736,9 @@ void notifySidechainWindowTrackListChanged()
 
 struct EqWindowState
 {
+    HWND graph = nullptr;
+    std::array<HWND, 6> paramSliders{};
+    std::array<HWND, 6> paramLabels{};
     int trackId = 0;
     HWND trackLabel = nullptr;
     HWND enableCheckbox = nullptr;
@@ -3624,6 +3757,7 @@ EqWindowState* getEqWindowState(HWND hwnd)
 
 void eqWindowApplyFont(const EqWindowState& state, HFONT font)
 {
+    for (HWND control : state.paramLabels) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     const HWND controls[] = {
         state.trackLabel,
         state.enableCheckbox,
@@ -3656,6 +3790,19 @@ void eqWindowSyncControls(HWND hwnd, EqWindowState* state)
         return;
 
     int trackId = state->trackId;
+    if(state->graph)setEqGraphTrack(state->graph,trackId);
+    for (size_t i = 0; i < 6; ++i) {
+        bool frequency = i % 2 == 0;
+        float value = frequency ? trackGetEqFrequency(trackId, static_cast<int>(i / 2)) : trackGetEqQ(trackId, static_cast<int>(i / 2));
+        double minimum = frequency ? 20.0 : 0.1;
+        double ratio = frequency ? 1000.0 : 100.0;
+        int pos = static_cast<int>(std::lround(std::log(value / minimum) / std::log(ratio) * 1000.0));
+        SendMessageW(state->paramSliders[i], TBM_SETPOS, TRUE, pos);
+        EnableWindow(state->paramSliders[i], trackId > 0 && trackGetEqEnabled(trackId));
+        wchar_t label[64];
+        swprintf(label, 64, frequency ? L"B%u: %.0f Hz" : L"B%u Q: %.2f", static_cast<unsigned>(i / 2 + 1), value);
+        SetWindowTextW(state->paramLabels[i], label);
+    }
     if (trackId <= 0)
     {
         if (state->trackLabel)
@@ -3702,6 +3849,7 @@ void eqWindowSyncControls(HWND hwnd, EqWindowState* state)
     if (state->trackLabel)
         SetWindowTextW(state->trackLabel, labelText.c_str());
 
+    if(state->graph)setEqGraphTrack(state->graph,trackPtr->id);
     bool eqEnabled = trackPtr->eqEnabled;
     if (state->enableCheckbox)
     {
@@ -3709,19 +3857,22 @@ void eqWindowSyncControls(HWND hwnd, EqWindowState* state)
         SendMessageW(state->enableCheckbox, BM_SETCHECK, eqEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     }
 
-    auto syncSlider = [&](HWND slider, HWND valueLabel, float gain)
+    auto syncSlider = [&](HWND slider, HWND valueLabel, float gain, int band)
     {
         if (!slider)
             return;
-        EnableWindow(slider, eqEnabled ? TRUE : FALSE);
+        EnableWindow(slider, eqEnabled && eq::hasGain(static_cast<eq::Shape>(trackGetEqShape(trackId,band))) ? TRUE : FALSE);
         int pos = static_cast<int>(std::lround((gain - kMixerEqMin) * 10.0f));
         SendMessageW(slider, TBM_SETPOS, TRUE, pos);
         eqWindowSetValueText(valueLabel, gain);
     };
 
-    syncSlider(state->lowSlider, state->lowValueLabel, trackPtr->lowGainDb);
-    syncSlider(state->midSlider, state->midValueLabel, trackPtr->midGainDb);
-    syncSlider(state->highSlider, state->highValueLabel, trackPtr->highGainDb);
+    syncSlider(state->lowSlider, state->lowValueLabel, trackPtr->lowGainDb,0);
+    syncSlider(state->midSlider, state->midValueLabel, trackPtr->midGainDb,1);
+    syncSlider(state->highSlider, state->highValueLabel, trackPtr->highGainDb,2);
+    SetWindowTextW(state->lowValueLabel, (L"B1: " + ToWideString(formatEqValue(trackPtr->lowGainDb))).c_str());
+    SetWindowTextW(state->midValueLabel, (L"B2: " + ToWideString(formatEqValue(trackPtr->midGainDb))).c_str());
+    SetWindowTextW(state->highValueLabel, (L"B3: " + ToWideString(formatEqValue(trackPtr->highGainDb))).c_str());
 }
 
 void eqWindowLayout(HWND hwnd, EqWindowState* state, int width, int height)
@@ -3767,9 +3918,16 @@ void eqWindowLayout(HWND hwnd, EqWindowState* state, int width, int height)
         currentY += sliderHeight + controlSpacing;
     };
 
+    if(state->graph){MoveWindow(state->graph,padding,currentY,width-padding*2,230,TRUE);currentY+=242;}
     layoutSlider(state->lowSlider, state->lowValueLabel);
+    layoutSlider(state->paramSliders[0], state->paramLabels[0]);
+    layoutSlider(state->paramSliders[1], state->paramLabels[1]);
     layoutSlider(state->midSlider, state->midValueLabel);
+    layoutSlider(state->paramSliders[2], state->paramLabels[2]);
+    layoutSlider(state->paramSliders[3], state->paramLabels[3]);
     layoutSlider(state->highSlider, state->highValueLabel);
+    layoutSlider(state->paramSliders[4], state->paramLabels[4]);
+    layoutSlider(state->paramSliders[5], state->paramLabels[5]);
 }
 
 LRESULT CALLBACK EqWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -3842,9 +4000,14 @@ LRESULT CALLBACK EqWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                                          nullptr);
         };
 
+        newState->graph=createEqGraph(hwnd);
         createSlider(newState->lowSlider, newState->lowValueLabel);
         createSlider(newState->midSlider, newState->midValueLabel);
         createSlider(newState->highSlider, newState->highValueLabel);
+        for (size_t i = 0; i < 6; ++i) {
+            createSlider(newState->paramSliders[i], newState->paramLabels[i]);
+            SendMessageW(newState->paramSliders[i], TBM_SETRANGE, TRUE, MAKELPARAM(0, 1000));
+        }
 
         HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
         eqWindowApplyFont(*newState, font);
@@ -3860,6 +4023,12 @@ LRESULT CALLBACK EqWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             eqWindowLayout(hwnd, state, LOWORD(lParam), HIWORD(lParam));
         return 0;
     case WM_COMMAND:
+        if(state && reinterpret_cast<HWND>(lParam)==state->graph && HIWORD(wParam)==EN_CHANGE){
+            eqWindowSyncControls(hwnd,state);
+            notifyEffectsWindowTrackValuesChanged(state->trackId);
+            if(gMainWindow)InvalidateRect(gMainWindow,nullptr,FALSE);
+            return 0;
+        }
         if (state && reinterpret_cast<HWND>(lParam) == state->enableCheckbox && HIWORD(wParam) == BN_CLICKED)
         {
             int trackId = state->trackId;
@@ -3902,6 +4071,14 @@ LRESULT CALLBACK EqWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
             if (handleSlider(state->lowSlider, trackSetEqLowGain))
                 return 0;
+            for (size_t i = 0; i < 6; ++i) {
+                if (control != state->paramSliders[i]) continue;
+                double normalized = SendMessageW(control, TBM_GETPOS, 0, 0) / 1000.0;
+                if (i % 2 == 0) trackSetEqFrequency(trackId, static_cast<int>(i / 2), static_cast<float>(20.0 * std::pow(1000.0, normalized)));
+                else trackSetEqQ(trackId, static_cast<int>(i / 2), static_cast<float>(0.1 * std::pow(100.0, normalized)));
+                eqWindowSyncControls(hwnd, state);
+                return 0;
+            }
             if (handleSlider(state->midSlider, trackSetEqMidGain))
                 return 0;
             if (handleSlider(state->highSlider, trackSetEqHighGain))
@@ -3977,12 +4154,12 @@ void openEqWindow(HWND parent, int trackId)
 
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW,
                                 L"KJEqWindow",
-                                L"Track Equalizer",
+                                L"KJ Parametric EQ",
                                 WS_OVERLAPPEDWINDOW ^ WS_THICKFRAME,
                                 x,
                                 y,
-                                360,
-                                260,
+                                760,
+                                800,
                                 parent,
                                 nullptr,
                                 GetModuleHandle(nullptr),
@@ -4470,53 +4647,7 @@ void ensureEffectsWindowClass()
 
 void toggleEffectsWindow(HWND parent)
 {
-    if (gEffectsWindow && IsWindow(gEffectsWindow))
-    {
-        closeEffectsWindow();
-        if (gMainWindow)
-        {
-            InvalidateRect(gMainWindow, nullptr, FALSE);
-        }
-        return;
-    }
-
-    ensureEffectsWindowClass();
-    if (!gEffectsWindowClassRegistered)
-        return;
-
-    RECT parentRect {0, 0, 0, 0};
-    if (parent && IsWindow(parent))
-    {
-        GetWindowRect(parent, &parentRect);
-    }
-
-    int x = CW_USEDEFAULT;
-    int y = CW_USEDEFAULT;
-    if (parentRect.right > parentRect.left && parentRect.bottom > parentRect.top)
-    {
-        x = parentRect.left + 60;
-        y = parentRect.top + 60;
-    }
-
-    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW,
-                                kEffectsWindowClassName,
-                                L"Track Effects",
-                                WS_OVERLAPPEDWINDOW,
-                                x,
-                                y,
-                                kEffectsWindowWidth,
-                                kEffectsWindowHeight,
-                                parent,
-                                nullptr,
-                                GetModuleHandle(nullptr),
-                                nullptr);
-    if (hwnd)
-    {
-        gEffectsWindow = hwnd;
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
-        requestMainMenuRefresh();
-    }
+    revealEditingPanel(EditingPage::Fx);
 }
 
 void notifyEffectsWindowTrackListChanged()
@@ -4693,7 +4824,7 @@ LRESULT CALLBACK EffectsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             ListView_InsertColumn(newState->effectList, 1, &column);
 
             newState->effectEntries = {
-                {EffectListItemType::Eq, L"Equalizer"},
+                {EffectListItemType::Eq, L"3-Band Parametric EQ"},
                 {EffectListItemType::Delay, L"Delay"},
                 {EffectListItemType::Compressor, L"Compressor"},
                 {EffectListItemType::Sidechain, L"Sidechain"},
@@ -5006,11 +5137,7 @@ float sliderValueFromLocalPosition(const SliderControlRects& slider, int localX,
     if (trackWidth <= 0)
         return minValue;
 
-    constexpr int kSliderHandleWidth = 18;
-    int handleTravel = std::max(trackWidth - kSliderHandleWidth, 1);
-    int desiredHandleLeft = localX - kSliderHandleWidth / 2;
-    int clampedHandleLeft = std::clamp(desiredHandleLeft, trackLeftLocal, trackLeftLocal + handleTravel);
-    double normalized = static_cast<double>(clampedHandleLeft - trackLeftLocal) / static_cast<double>(handleTravel);
+    double normalized=std::clamp(double(localX-trackLeftLocal)/trackWidth,0.0,1.0);
     double value = static_cast<double>(minValue) + normalized * (static_cast<double>(maxValue) - static_cast<double>(minValue));
     float result = static_cast<float>(value);
     return std::clamp(result, minValue, maxValue);
@@ -5018,17 +5145,8 @@ float sliderValueFromLocalPosition(const SliderControlRects& slider, int localX,
 
 bool sliderHitTest(const SliderControlRects& slider, int x, int y)
 {
-    constexpr int kControlHitPadding = 6;
-    if (x >= slider.control.left - kControlHitPadding && x < slider.control.right + kControlHitPadding &&
-        y >= slider.control.top - kControlHitPadding && y < slider.control.bottom + kControlHitPadding)
-    {
-        return true;
-    }
-
-    constexpr int kTrackHitPaddingX = 10;
-    constexpr int kTrackHitPaddingY = 8;
-    return x >= slider.track.left - kTrackHitPaddingX && x < slider.track.right + kTrackHitPaddingX &&
-           y >= slider.track.top - kTrackHitPaddingY && y < slider.track.bottom + kTrackHitPaddingY;
+    return slider.control.right>slider.control.left && slider.control.bottom>slider.control.top &&
+        x>=slider.control.left && x<slider.control.right && y>=slider.control.top && y<slider.control.bottom;
 }
 
 void beginSliderDrag(HWND hwnd, SliderDragTarget target, int trackId, int oscIndex = -1)
@@ -5198,66 +5316,44 @@ void updateSliderDrag(HWND hwnd, int x)
         break;
     case SliderDragTarget::SynthAttack:
         applySliderChange(gSynthAttackSliderControl, kSynthAttackMin, kSynthAttackMax,
-                          [trackId, oscIndex](float value) {
-                              if (oscIndex >= 0)
-                              {
-                                  trackSetSynthOscAttack(trackId, oscIndex, value);
-                              }
-                              else
-                              {
-                                  trackSetSynthAttack(trackId, value);
-                              }
-                          });
+                          [trackId](float value) { trackSetSynthAttack(trackId, value); });
         break;
     case SliderDragTarget::SynthDecay:
         applySliderChange(gSynthDecaySliderControl, kSynthDecayMin, kSynthDecayMax,
-                          [trackId, oscIndex](float value) {
-                              if (oscIndex >= 0)
-                              {
-                                  trackSetSynthOscDecay(trackId, oscIndex, value);
-                              }
-                              else
-                              {
-                                  trackSetSynthDecay(trackId, value);
-                              }
-                          });
+                          [trackId](float value) { trackSetSynthDecay(trackId, value); });
         break;
     case SliderDragTarget::SynthSustain:
         applySliderChange(gSynthSustainSliderControl, kSynthSustainMin, kSynthSustainMax,
-                          [trackId, oscIndex](float value) {
-                              if (oscIndex >= 0)
-                              {
-                                  trackSetSynthOscSustain(trackId, oscIndex, value);
-                              }
-                              else
-                              {
-                                  trackSetSynthSustain(trackId, value);
-                              }
-                          });
+                          [trackId](float value) { trackSetSynthSustain(trackId, value); });
         break;
     case SliderDragTarget::SynthRelease:
         applySliderChange(gSynthReleaseSliderControl, kSynthReleaseMin, kSynthReleaseMax,
-                          [trackId, oscIndex](float value) {
-                              if (oscIndex >= 0)
-                              {
-                                  trackSetSynthOscRelease(trackId, oscIndex, value);
-                              }
-                              else
-                              {
-                                  trackSetSynthRelease(trackId, value);
-                              }
-                          });
+                          [trackId](float value) { trackSetSynthRelease(trackId, value); });
         break;
     case SliderDragTarget::SynthWavetableToggle:
         break;
+    case SliderDragTarget::SynthWavetablePosition:
+        applySliderChange(gSynthWavetablePositionSliderControl, 0.0f, 3.0f,
+            [trackId, oscIndex](float value) { trackSetSynthOscWavetablePosition(trackId, std::max(0, oscIndex), value); });
+        break;
+    case SliderDragTarget::SynthWavetableMix:
+        applySliderChange(gSynthWavetableMixSliderControl, 0.0f, 1.0f,
+            [trackId, oscIndex](float value) { trackSetSynthOscWavetableMix(trackId, std::max(0, oscIndex), value); });
+        break;
     case SliderDragTarget::SampleAttack:
         applySliderChange(gSampleAttackSliderControl, kSampleAttackMin, kSampleAttackMax,
-                          [trackId](float value) { trackSetSampleAttack(trackId, value); });
+                          [trackId](float value) { if(gSampleDragLane>=0)trackSetDrumParameter(trackId,gSampleDragLane,DrumParameter::Attack,value);else trackSetSampleAttack(trackId, value); });
         break;
     case SliderDragTarget::SampleRelease:
         applySliderChange(gSampleReleaseSliderControl, kSampleReleaseMin, kSampleReleaseMax,
-                          [trackId](float value) { trackSetSampleRelease(trackId, value); });
+                          [trackId](float value) { if(gSampleDragLane>=0)trackSetDrumParameter(trackId,gSampleDragLane,DrumParameter::Release,value);else trackSetSampleRelease(trackId, value); });
         break;
+    case SliderDragTarget::DrumPitch:
+        applySliderChange(gDrumPitchSliderControl,-48.f,48.f,[trackId](float v){trackSetDrumParameter(trackId,gSampleDragLane,DrumParameter::Pitch,v);});break;
+    case SliderDragTarget::DrumPan:
+        applySliderChange(gDrumPanSliderControl,-1.f,1.f,[trackId](float v){trackSetDrumParameter(trackId,gSampleDragLane,DrumParameter::Pan,v);});break;
+    case SliderDragTarget::DrumVolume:
+        applySliderChange(gDrumVolumeSliderControl,0.f,1.f,[trackId](float v){trackSetDrumParameter(trackId,gSampleDragLane,DrumParameter::Volume,v);});break;
     case SliderDragTarget::None:
     default:
         break;
@@ -5267,79 +5363,21 @@ void updateSliderDrag(HWND hwnd, int x)
 void drawSliderControl(LICE_SysBitmap& surface, SliderControlRects& sliderRects, const RECT& area, double normalizedValue,
                        const char* label, const std::string& valueText)
 {
-    sliderRects.control = area;
+    sliderRects={};
+    if(area.right<=area.left||area.bottom<=area.top)return;
+    RECT control=area;control.bottom=std::min<LONG>(control.bottom,control.top+48);
+    sliderRects.control=control;
+    LICE_FillRect(&surface,control.left,control.top,control.right-control.left,control.bottom-control.top,LICE_ColorFromCOLORREF(RGB(34,34,34)));
+    RECT title=control;title.left+=6;title.bottom=std::min<LONG>(title.top+22,control.bottom);
+    std::string caption=std::string(label)+": "+valueText;
+    drawText(surface,title,caption.c_str(),RGB(230,230,230),DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+    RECT bar=control;bar.left+=6;bar.right-=6;bar.top+=27;bar.bottom-=5;
+    if(bar.right<=bar.left||bar.bottom<=bar.top)return;
+    sliderRects.track=bar;
+    LICE_FillRect(&surface,bar.left,bar.top,bar.right-bar.left,bar.bottom-bar.top,LICE_ColorFromCOLORREF(RGB(65,65,65)));
+    int amount=static_cast<int>((bar.right-bar.left)*std::clamp(normalizedValue,0.0,1.0));
+    LICE_FillRect(&surface,bar.left,bar.top,amount,bar.bottom-bar.top,LICE_ColorFromCOLORREF(RGB(0,125,190)));
 
-    int width = area.right - area.left;
-    int height = area.bottom - area.top;
-    if (width <= 0 || height <= 0)
-    {
-        sliderRects.track = {0, 0, 0, 0};
-        sliderRects.handle = {0, 0, 0, 0};
-        return;
-    }
-
-    LICE_FillRect(&surface, area.left, area.top, width, height, LICE_ColorFromCOLORREF(RGB(35, 35, 35)));
-    LICE_DrawRect(&surface, area.left, area.top, width, height, LICE_ColorFromCOLORREF(RGB(70, 70, 70)));
-
-    int spacing = std::min(6, std::max(2, height / 10));
-    int labelHeight = std::min(18, std::max(12, height / 4));
-    int valueHeight = std::min(18, std::max(12, height / 4));
-    int minimumTrackHeight = 8;
-
-    int available = height - labelHeight - valueHeight - spacing * 2;
-    if (available < minimumTrackHeight)
-    {
-        int deficit = minimumTrackHeight - available;
-        int labelReduction = std::min(deficit / 2, std::max(labelHeight - 10, 0));
-        labelHeight -= labelReduction;
-        deficit -= labelReduction;
-        int valueReduction = std::min(deficit, std::max(valueHeight - 10, 0));
-        valueHeight -= valueReduction;
-        available = height - labelHeight - valueHeight - spacing * 2;
-        if (available < minimumTrackHeight)
-            available = minimumTrackHeight;
-    }
-
-    RECT labelRect = area;
-    labelRect.bottom = std::min(labelRect.top + labelHeight, area.bottom);
-    drawText(surface, labelRect, label, RGB(220, 220, 220), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-    RECT valueRect = area;
-    valueRect.top = std::max<LONG>(valueRect.bottom - valueHeight, area.top);
-    drawText(surface, valueRect, valueText.c_str(), RGB(200, 200, 200), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-
-    RECT trackRect = area;
-    trackRect.top = std::min<LONG>(labelRect.bottom + spacing, area.bottom);
-    trackRect.bottom = std::max<LONG>(valueRect.top - spacing, trackRect.top + minimumTrackHeight);
-
-    int horizontalPadding = std::min(10, std::max(4, width / 6));
-    trackRect.left += horizontalPadding;
-    trackRect.right -= horizontalPadding;
-    if (trackRect.right <= trackRect.left)
-    {
-        int mid = (trackRect.left + trackRect.right) / 2;
-        trackRect.left = mid - 10;
-        trackRect.right = mid + 10;
-    }
-
-    int trackHeight = std::max(static_cast<int>(trackRect.bottom - trackRect.top), minimumTrackHeight);
-    int trackWidth = std::max(static_cast<int>(trackRect.right - trackRect.left), 1);
-    trackRect.bottom = trackRect.top + trackHeight;
-    LICE_FillRect(&surface, trackRect.left, trackRect.top, trackWidth, trackHeight, LICE_ColorFromCOLORREF(RGB(55, 55, 55)));
-    LICE_DrawRect(&surface, trackRect.left, trackRect.top, trackWidth, trackHeight, LICE_ColorFromCOLORREF(RGB(90, 90, 90)));
-
-    double clampedNorm = std::clamp(normalizedValue, 0.0, 1.0);
-    constexpr int handleWidth = 18;
-    int handleRange = std::max(trackWidth - handleWidth, 1);
-    int handleX = trackRect.left + static_cast<int>(std::round(clampedNorm * handleRange));
-    RECT handleRect {handleX, trackRect.top - 4, handleX + handleWidth, trackRect.bottom + 4};
-    LICE_FillRect(&surface, handleRect.left, handleRect.top, handleRect.right - handleRect.left,
-                  handleRect.bottom - handleRect.top, LICE_ColorFromCOLORREF(RGB(0, 120, 200)));
-    LICE_DrawRect(&surface, handleRect.left, handleRect.top, handleRect.right - handleRect.left,
-                  handleRect.bottom - handleRect.top, LICE_ColorFromCOLORREF(RGB(20, 20, 20)));
-
-    sliderRects.track = trackRect;
-    sliderRects.handle = handleRect;
 }
 
 void drawSequencer(LICE_SysBitmap& surface, int activeTrackId)
@@ -5365,7 +5403,7 @@ void drawSequencer(LICE_SysBitmap& surface, int activeTrackId)
         const int width = rect.right - rect.left;
         const int height = rect.bottom - rect.top;
         int stepIndex = currentStepPage * kSequencerStepsPerPage + i;
-        bool inRange = stepIndex < totalSteps;
+        bool inRange = stepIndex < totalSteps && trackGetType(activeTrackId)!=TrackType::AudioIn;
         bool active = inRange && getTrackStepState(activeTrackId, stepIndex);
 
         COLORREF fill = active ? RGB(0, 120, 200) : RGB(45, 45, 45);
@@ -5412,6 +5450,8 @@ void drawSynthTrackControls(LICE_SysBitmap& surface, const RECT& client, const T
     gSynthFeedbackSliderControl = {};
     gSynthPitchSliderControl = {};
     gSynthPitchRangeSliderControl = {};
+    gSynthWavetablePositionSliderControl = {};
+    gSynthWavetableMixSliderControl = {};
     gSynthAttackSliderControl = {};
     gSynthDecaySliderControl = {};
     gSynthSustainSliderControl = {};
@@ -5429,19 +5469,6 @@ void drawSynthTrackControls(LICE_SysBitmap& surface, const RECT& client, const T
     int areaLeft = client.left + 12;
     int areaRight = client.right - 12;
     int baseTop = client.top + 12;
-    if (!stepRects.empty() && stepRects.back().right > stepRects.front().left)
-    {
-        const RECT& firstStep = stepRects.front();
-        const RECT& lastStep = stepRects.back();
-        constexpr int kMinSynthControlAreaHeight = 220;
-        bool hasVerticalRoom = firstStep.bottom + 12 + kMinSynthControlAreaHeight <= client.bottom;
-        if (firstStep.right <= client.right + 1 && hasVerticalRoom)
-        {
-            areaLeft = firstStep.left;
-            areaRight = lastStep.right;
-            baseTop = firstStep.bottom + 12;
-        }
-    }
     if (areaRight <= areaLeft)
         return;
 
@@ -5449,21 +5476,22 @@ void drawSynthTrackControls(LICE_SysBitmap& surface, const RECT& client, const T
     int headerSpacing = 6;
     int toggleHeight = 18;
     int tabHeight = 20;
-    int wavetableHeight = 18;
     int rowSpacing = 12;
-    int rows = 3;
+    int rows = activeTrack->synthOscillators[0].wavetableEnabled ? 4 : 3;
     int slidersPerRow = 3;
     int sliderSpacing = 12;
-    int sliderHeight = 70;
+    int sliderHeight = 48;
     int areaTop = baseTop + topSpacing;
 
     bool threeOscEnabled = activeTrack->synthThreeOscEnabled;
     int oscIndex = threeOscEnabled ? getSynthOscTabIndex(activeTrack->id) : 0;
     int currentTop = areaTop;
     int toggleWidth = 100;
-    if (toggleWidth > areaRight - areaLeft)
-        toggleWidth = areaRight - areaLeft;
+    toggleWidth = std::min(toggleWidth, (areaRight - areaLeft - headerSpacing) / 2);
     synthThreeOscToggleButton = {areaLeft, currentTop, areaLeft + toggleWidth, currentTop + toggleHeight};
+    int wavetableLeft = synthThreeOscToggleButton.right + headerSpacing;
+    synthWavetableToggleButton = {wavetableLeft, currentTop,
+        std::min(areaRight, wavetableLeft + 140), currentTop + toggleHeight};
     currentTop = synthThreeOscToggleButton.bottom + headerSpacing;
 
     if (threeOscEnabled)
@@ -5484,11 +5512,6 @@ void drawSynthTrackControls(LICE_SysBitmap& surface, const RECT& client, const T
         }
         currentTop = synthOscTabButtons[0].bottom + headerSpacing;
 
-        int wavetableWidth = 140;
-        if (wavetableWidth > areaRight - areaLeft)
-            wavetableWidth = areaRight - areaLeft;
-        synthWavetableToggleButton = {areaLeft, currentTop, areaLeft + wavetableWidth, currentTop + wavetableHeight};
-        currentTop = synthWavetableToggleButton.bottom + headerSpacing;
     }
 
     areaTop = currentTop;
@@ -5539,14 +5562,20 @@ void drawSynthTrackControls(LICE_SysBitmap& surface, const RECT& client, const T
     float feedbackValue = oscSettings ? oscSettings->feedback : activeTrack->feedback;
     float pitchValue = oscSettings ? oscSettings->pitch : activeTrack->pitch;
     float pitchRangeValue = oscSettings ? oscSettings->pitchRange : activeTrack->pitchRange;
-    float attackValue = oscSettings ? oscSettings->attack : activeTrack->synthAttack;
-    float decayValue = oscSettings ? oscSettings->decay : activeTrack->synthDecay;
-    float sustainValue = oscSettings ? oscSettings->sustain : activeTrack->synthSustain;
-    float releaseValue = oscSettings ? oscSettings->release : activeTrack->synthRelease;
+    // Playback uses one amplitude envelope per note, shared across oscillator tabs.
+    float attackValue = activeTrack->synthAttack;
+    float decayValue = activeTrack->synthDecay;
+    float sustainValue = activeTrack->synthSustain;
+    float releaseValue = activeTrack->synthRelease;
 
     COLORREF toggleFill = threeOscEnabled ? RGB(0, 90, 160) : RGB(50, 50, 50);
     COLORREF toggleOutline = threeOscEnabled ? RGB(20, 20, 20) : RGB(120, 120, 120);
     drawButton(surface, synthThreeOscToggleButton, toggleFill, toggleOutline, "3 Osc");
+    bool wavetableEnabled = activeTrack->synthOscillators[0].wavetableEnabled;
+    COLORREF wavetableFill = wavetableEnabled ? RGB(0, 90, 160) : RGB(50, 50, 50);
+    COLORREF wavetableOutline = wavetableEnabled ? RGB(20, 20, 20) : RGB(120, 120, 120);
+    drawButton(surface, synthWavetableToggleButton, wavetableFill, wavetableOutline,
+               wavetableEnabled ? "Wavetable On" : "Wavetable Off");
 
     if (threeOscEnabled)
     {
@@ -5559,11 +5588,6 @@ void drawSynthTrackControls(LICE_SysBitmap& surface, const RECT& client, const T
             drawButton(surface, synthOscTabButtons[i], tabFill, tabOutline, label.c_str());
         }
 
-        bool wavetableEnabled = oscSettings ? oscSettings->wavetableEnabled : false;
-        COLORREF wavetableFill = wavetableEnabled ? RGB(0, 90, 160) : RGB(50, 50, 50);
-        COLORREF wavetableOutline = wavetableEnabled ? RGB(20, 20, 20) : RGB(120, 120, 120);
-        drawButton(surface, synthWavetableToggleButton, wavetableFill, wavetableOutline,
-                   wavetableEnabled ? "Wavetable On" : "Wavetable Off");
     }
 
     double formantNorm = computeNormalized(formantValue, kSynthFormantMin, kSynthFormantMax);
@@ -5610,95 +5634,40 @@ void drawSynthTrackControls(LICE_SysBitmap& surface, const RECT& client, const T
     RECT releaseRect = makeSliderRect(2, 2);
     drawSliderControl(surface, gSynthReleaseSliderControl, releaseRect, releaseNorm,
                       "Release", formatSecondsValue(releaseValue));
+    if (wavetableEnabled)
+    {
+        const auto& settings = activeTrack->synthOscillators[static_cast<size_t>(oscIndex)];
+        drawSliderControl(surface, gSynthWavetablePositionSliderControl, makeSliderRect(3, 0),
+            computeNormalized(settings.wavetablePosition, 0.0f, 3.0f),
+            "WT Position", formatNormalizedValue(settings.wavetablePosition));
+        drawSliderControl(surface, gSynthWavetableMixSliderControl, makeSliderRect(3, 1),
+            computeNormalized(settings.wavetableMix, 0.0f, 1.0f),
+            "WT Mix", formatNormalizedValue(settings.wavetableMix));
+    }
 }
+
+constexpr int kSamplerDrumModeId = 4101;
+constexpr int kSamplerPitchModeId = 4102;
+constexpr int kSamplerSelectionId = 4103;
 
 void drawSampleTrackControls(LICE_SysBitmap& surface, const RECT& client, const Track* activeTrack)
 {
-    gSampleAttackSliderControl = {};
-    gSampleReleaseSliderControl = {};
-
-    if (!activeTrack || activeTrack->type != TrackType::Sample)
-        return;
-
-    int areaLeft = client.left + 12;
-    int areaRight = client.right - 12;
-    int baseTop = client.top + 12;
-    if (!stepRects.empty() && stepRects.back().right > stepRects.front().left)
-    {
-        const RECT& firstStep = stepRects.front();
-        const RECT& lastStep = stepRects.back();
-        constexpr int kMinSampleControlAreaHeight = 80;
-        bool hasVerticalRoom = firstStep.bottom + 12 + kMinSampleControlAreaHeight <= client.bottom;
-        if (firstStep.right <= client.right + 1 && hasVerticalRoom)
-        {
-            areaLeft = firstStep.left;
-            areaRight = lastStep.right;
-            baseTop = firstStep.bottom + 12;
-        }
+    gSampleAttackSliderControl={};gSampleReleaseSliderControl={};
+    gDrumPitchSliderControl={};gDrumPanSliderControl={};gDrumVolumeSliderControl={};
+    if(!activeTrack||activeTrack->type!=TrackType::Sample)return;
+    const bool drumMode=trackGetSampleDrumMode(activeTrack->id);
+    const auto drum=trackGetDrumSettings(activeTrack->id,trackGetSelectedDrum(activeTrack->id));
+    int width=std::max(1,(int(client.right)-36)/2),top=drumMode?76:56;
+    auto bounds=[&](int row,int col){int x=12+col*(width+12),y=top+row*60;return RECT{x,y,x+width,y+48};};
+    float attack=drumMode?drum.attack:activeTrack->sampleAttack,release=drumMode?drum.release:activeTrack->sampleRelease;
+    drawSliderControl(surface,gSampleAttackSliderControl,bounds(0,0),computeNormalized(attack,0,4),"Attack",formatSecondsValue(attack));
+    drawSliderControl(surface,gSampleReleaseSliderControl,bounds(0,1),computeNormalized(release,0,4),"Release",formatSecondsValue(release));
+    if(drumMode){
+        drawSliderControl(surface,gDrumPitchSliderControl,bounds(1,0),computeNormalized(drum.pitch,-48,48),"Pitch",formatPitchValue(drum.pitch));
+        drawSliderControl(surface,gDrumPanSliderControl,bounds(1,1),computeNormalized(drum.pan,-1,1),"Pan",formatPanValue(drum.pan));
+        drawSliderControl(surface,gDrumVolumeSliderControl,bounds(2,0),computeNormalized(drum.volume,0,1),"Volume",formatVolumeValue(drum.volume));
     }
-    if (areaRight <= areaLeft)
-        return;
 
-    int topSpacing = 12;
-    int sliderSpacing = 12;
-    int sliderHeight = 70;
-    int areaTop = baseTop + topSpacing;
-    int areaBottom = areaTop + sliderHeight;
-    if (areaBottom > client.bottom)
-    {
-        areaBottom = client.bottom;
-        if (areaBottom - areaTop < 32)
-            areaTop = std::max<int>(areaBottom - 32, baseTop + 2);
-    }
-    if (areaBottom <= areaTop)
-        return;
-
-    int totalWidth = areaRight - areaLeft;
-    int sliderCount = 2;
-    int totalSpacing = sliderSpacing * (sliderCount - 1);
-    int sliderWidth = totalWidth - totalSpacing;
-    if (sliderWidth <= 0)
-        return;
-    sliderWidth /= sliderCount;
-    if (sliderWidth <= 0)
-        return;
-
-    auto makeSliderRect = [&](int index) {
-        int left = areaLeft + index * (sliderWidth + sliderSpacing);
-        RECT rect {left, areaTop, left + sliderWidth, areaBottom};
-        if (rect.right > areaRight)
-            rect.right = areaRight;
-        return rect;
-    };
-
-    double attackNorm = computeNormalized(activeTrack->sampleAttack, kSampleAttackMin, kSampleAttackMax);
-    RECT attackRect = makeSliderRect(0);
-    drawSliderControl(surface, gSampleAttackSliderControl, attackRect, attackNorm,
-                      "Attack", formatSecondsValue(activeTrack->sampleAttack));
-
-    double releaseNorm = computeNormalized(activeTrack->sampleRelease, kSampleReleaseMin, kSampleReleaseMax);
-    RECT releaseRect = makeSliderRect(1);
-    drawSliderControl(surface, gSampleReleaseSliderControl, releaseRect, releaseNorm,
-                      "Release", formatSecondsValue(activeTrack->sampleRelease));
-}
-
-void clearParameterControlRects()
-{
-    gSynthFormantSliderControl = {};
-    gSynthResonanceSliderControl = {};
-    gSynthFeedbackSliderControl = {};
-    gSynthPitchSliderControl = {};
-    gSynthPitchRangeSliderControl = {};
-    gSynthAttackSliderControl = {};
-    gSynthDecaySliderControl = {};
-    gSynthSustainSliderControl = {};
-    gSynthReleaseSliderControl = {};
-    gSampleAttackSliderControl = {};
-    gSampleReleaseSliderControl = {};
-    synthThreeOscToggleButton = {};
-    synthWavetableToggleButton = {};
-    for (auto& rect : synthOscTabButtons)
-        rect = {};
 }
 
 const Track* getActiveTrackSnapshot(std::vector<Track>& tracks, Track& fallbackTrack, int& activeTrackIdOut)
@@ -5741,12 +5710,168 @@ const Track* getActiveTrackSnapshot(std::vector<Track>& tracks, Track& fallbackT
             fallbackTrack.synthOscillators[oscIndex].release = trackGetSynthOscRelease(activeTrackId, static_cast<int>(oscIndex));
             fallbackTrack.synthOscillators[oscIndex].wavetableEnabled =
                 trackGetSynthOscWavetableEnabled(activeTrackId, static_cast<int>(oscIndex));
+            fallbackTrack.synthOscillators[oscIndex].wavetablePosition =
+                trackGetSynthOscWavetablePosition(activeTrackId, static_cast<int>(oscIndex));
+            fallbackTrack.synthOscillators[oscIndex].wavetableMix =
+                trackGetSynthOscWavetableMix(activeTrackId, static_cast<int>(oscIndex));
         }
         fallbackTrack.sampleAttack = trackGetSampleAttack(activeTrackId);
         fallbackTrack.sampleRelease = trackGetSampleRelease(activeTrackId);
         activeTrackPtr = &fallbackTrack;
     }
     return activeTrackPtr;
+}
+
+struct SampleBankEntry
+{
+    std::filesystem::path path;
+    std::shared_ptr<const SampleBuffer> buffer;
+};
+
+// Shared for this session, with no fixed number of sample slots.
+std::vector<SampleBankEntry> gSampleBank;
+std::wstring sampleDrumRowLabel(int row)
+{
+    size_t index = static_cast<size_t>(gDrumRowOffset + row);
+    return index < gSampleBank.size() ? std::to_wstring(index + 1) + L". " + gSampleBank[index].path.filename().wstring() : L"";
+}
+HWND gSampleBankWindow = nullptr;
+HWND gSampleBankList = nullptr;
+constexpr int kSampleBankAddId = 1;
+constexpr int kSampleBankListId = 2;
+constexpr int kSampleBankHeight = 240;
+
+void syncSampleBankSelection(int trackId)
+{
+    if (!gSampleBankList)
+        return;
+    auto buffer = trackGetSampleBuffer(trackId);
+    LRESULT selected = -1;
+    for (size_t i = 0; i < gSampleBank.size(); ++i)
+    {
+        if (gSampleBank[i].buffer == buffer)
+        {
+            selected = static_cast<LRESULT>(i);
+            break;
+        }
+    }
+    SendMessageW(gSampleBankList, LB_SETCURSEL, static_cast<WPARAM>(selected), 0);
+}
+
+bool addSampleToBank(int trackId, const std::filesystem::path& path)
+{
+    if (trackId <= 0 || trackGetType(trackId) != TrackType::Sample)
+        return false;
+    auto buffer = std::make_shared<SampleBuffer>();
+    if (!loadSampleFromFile(path, *buffer) || buffer->frameCount() == 0)
+        return false;
+    if (gSampleBankList)
+    {
+        std::wstring label = path.filename().wstring();
+        LRESULT row = SendMessageW(gSampleBankList, LB_ADDSTRING, 0,
+                                  reinterpret_cast<LPARAM>(label.c_str()));
+        if (row == LB_ERR || row == LB_ERRSPACE)
+            return false;
+    }
+    gSampleBank.push_back({path, buffer});
+    auto bankBuffers = std::make_shared<SampleBankBuffers>();
+    for (const auto& entry : gSampleBank) bankBuffers->push_back(entry.buffer);
+    sampleSetBankBuffers(std::move(bankBuffers));
+    invalidatePianoRollWindow();
+    trackSetSampleBuffer(trackId, std::move(buffer));
+    syncSampleBankSelection(trackId);
+    return true;
+}
+
+LRESULT CALLBACK SampleBankWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        HWND add = CreateWindowExW(0, L"BUTTON", L"+", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                  8, 8, 32, 28, hwnd,
+                                  reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSampleBankAddId)), GetModuleHandle(nullptr), nullptr);
+        CreateWindowExW(0, L"STATIC", L"Select a sample to use on this track", WS_CHILD | WS_VISIBLE,
+                        48, 14, 340, 20, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
+        gSampleBankList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            8, 44, 388, 140, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSampleBankListId)),
+            GetModuleHandle(nullptr), nullptr);
+        if (!add || !gSampleBankList)
+            return -1;
+        for (const auto& entry : gSampleBank)
+        {
+            std::wstring label = entry.path.filename().wstring();
+            SendMessageW(gSampleBankList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        }
+        return 0;
+    }
+    case WM_SIZE:
+        if (gSampleBankList)
+            MoveWindow(gSampleBankList, 8, 44, std::max(1, static_cast<int>(LOWORD(lParam)) - 16),
+                       std::max(1, static_cast<int>(HIWORD(lParam)) - 52), TRUE);
+        return 0;
+    case WM_EXITSIZEMOVE:
+        snapParamWindowsToMain();
+        return 0;
+    case WM_COMMAND:
+    {
+        int trackId = getActiveSequencerTrackId();
+        if (trackId <= 0 || trackGetType(trackId) != TrackType::Sample)
+            return 0;
+        if (LOWORD(wParam) == kSampleBankAddId && HIWORD(wParam) == BN_CLICKED)
+        {
+            wchar_t fileBuffer[32768]{};
+            OPENFILENAMEW ofn{};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrTitle = L"Add sample to bank";
+            ofn.lpstrFilter = L"WAV Files\0*.wav\0All Files\0*.*\0";
+            ofn.lpstrFile = fileBuffer;
+            ofn.nMaxFile = static_cast<DWORD>(std::size(fileBuffer));
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+            if (GetOpenFileNameW(&ofn) && !addSampleToBank(trackId, std::filesystem::path(fileBuffer)))
+                MessageBoxW(hwnd, L"Could not add this sample. Choose a supported, non-empty WAV file.",
+                            L"Sample Bank", MB_OK | MB_ICONERROR);
+            return 0;
+        }
+        if (LOWORD(wParam) == kSampleBankListId && HIWORD(wParam) == LBN_SELCHANGE)
+        {
+            LRESULT row = SendMessageW(gSampleBankList, LB_GETCURSEL, 0, 0);
+            if (row != LB_ERR && static_cast<size_t>(row) < gSampleBank.size()) {
+                trackSetSampleBuffer(trackId, gSampleBank[static_cast<size_t>(row)].buffer);
+                trackSetSelectedDrum(trackId,static_cast<int>(row));
+                if(gSampleParamsWindow)InvalidateRect(gSampleParamsWindow,nullptr,FALSE);
+            }
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    case WM_DESTROY:
+        gSampleBankList = nullptr;
+        gSampleBankWindow = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void openSampleBankWindow(HWND parent)
+{
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = SampleBankWndProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = L"KJSampleBankWindow";
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return;
+    gSampleBankWindow = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Sample Bank",
+        WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, 420, kSampleBankHeight, parent, nullptr, wc.hInstance, nullptr);
 }
 
 void snapParamWindowsToMain()
@@ -5763,7 +5888,13 @@ void snapParamWindowsToMain()
     if (gSynthParamsWindow && IsWindow(gSynthParamsWindow))
     {
         SetWindowPos(gSynthParamsWindow, nullptr, nextX, nextY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        nextY += 360;
+    }
+    if (gSampleBankWindow && IsWindow(gSampleBankWindow))
+    {
+        SetWindowPos(gSampleBankWindow, nullptr, nextX, nextY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        RECT bankRect{};
+        GetWindowRect(gSampleBankWindow, &bankRect);
+        nextY += bankRect.bottom - bankRect.top + 8;
     }
     if (gSampleParamsWindow && IsWindow(gSampleParamsWindow))
     {
@@ -5779,11 +5910,24 @@ void updateParamWindowsVisibility()
     const Track* activeTrack = getActiveTrackSnapshot(tracks, fallback, activeTrackId);
     TrackType activeType = activeTrack ? activeTrack->type : TrackType::Synth;
 
+    // Preserve an explicit close until the user selects a different track or type.
+    static int lastTrackId = -1;
+    static TrackType lastTrackType = TrackType::Synth;
+    if (activeTrackId == lastTrackId && activeType == lastTrackType)
+        return;
+    lastTrackId = activeTrackId;
+    lastTrackType = activeType;
+
     if (gSynthParamsWindow && IsWindow(gSynthParamsWindow))
         ShowWindow(gSynthParamsWindow, activeType == TrackType::Synth ? SW_SHOWNA : SW_HIDE);
     if (gSampleParamsWindow && IsWindow(gSampleParamsWindow))
         ShowWindow(gSampleParamsWindow, activeType == TrackType::Sample ? SW_SHOWNA : SW_HIDE);
 
+    if (gSampleBankWindow && IsWindow(gSampleBankWindow))
+    {
+        ShowWindow(gSampleBankWindow, activeType == TrackType::Sample ? SW_SHOWNA : SW_HIDE);
+        syncSampleBankSelection(activeTrackId);
+    }
     snapParamWindowsToMain();
 }
 
@@ -5791,6 +5935,12 @@ LRESULT CALLBACK SynthParamsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 {
     switch (msg)
     {
+    case WM_GETMINMAXINFO:
+    {
+        auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+        limits->ptMinTrackSize = {420, 400};
+        return 0;
+    }
     case WM_MOUSEACTIVATE:
         return MA_ACTIVATE;
     case WM_LBUTTONDOWN:
@@ -5816,30 +5966,16 @@ LRESULT CALLBACK SynthParamsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         {
             bool nextState = !synthThreeOscEnabled;
             trackSetSynthThreeOscEnabled(activeTrackId, nextState);
-            if (nextState)
-            {
-                float formant = trackGetSynthFormant(activeTrackId);
-                float resonance = trackGetSynthResonance(activeTrackId);
-                float feedback = trackGetSynthFeedback(activeTrackId);
-                float pitch = trackGetSynthPitch(activeTrackId);
-                float pitchRange = trackGetSynthPitchRange(activeTrackId);
-                float attack = trackGetSynthAttack(activeTrackId);
-                float decay = trackGetSynthDecay(activeTrackId);
-                float sustain = trackGetSynthSustain(activeTrackId);
-                float release = trackGetSynthRelease(activeTrackId);
-                for (int i = 0; i < static_cast<int>(kSynthOscillatorCount); ++i)
-                {
-                    trackSetSynthOscFormant(activeTrackId, i, formant);
-                    trackSetSynthOscResonance(activeTrackId, i, resonance);
-                    trackSetSynthOscFeedback(activeTrackId, i, feedback);
-                    trackSetSynthOscPitch(activeTrackId, i, pitch);
-                    trackSetSynthOscPitchRange(activeTrackId, i, pitchRange);
-                    trackSetSynthOscAttack(activeTrackId, i, attack);
-                    trackSetSynthOscDecay(activeTrackId, i, decay);
-                    trackSetSynthOscSustain(activeTrackId, i, sustain);
-                    trackSetSynthOscRelease(activeTrackId, i, release);
-                }
-            }
+            // Oscillator settings survive toggling the bank off and back on.
+            requestImmediateRedraw();
+            return 0;
+        }
+
+        if (pointInRect(synthWavetableToggleButton, x, y))
+        {
+            bool enabled = trackGetSynthOscWavetableEnabled(activeTrackId, 0);
+            for (size_t i = 0; i < kSynthOscillatorCount; ++i)
+                trackSetSynthOscWavetableEnabled(activeTrackId, static_cast<int>(i), !enabled);
             requestImmediateRedraw();
             return 0;
         }
@@ -5854,13 +5990,6 @@ LRESULT CALLBACK SynthParamsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                     requestImmediateRedraw();
                     return 0;
                 }
-            }
-            if (pointInRect(synthWavetableToggleButton, x, y))
-            {
-                bool enabled = trackGetSynthOscWavetableEnabled(activeTrackId, oscIndex);
-                trackSetSynthOscWavetableEnabled(activeTrackId, oscIndex, !enabled);
-                requestImmediateRedraw();
-                return 0;
             }
         }
 
@@ -5880,6 +6009,8 @@ LRESULT CALLBACK SynthParamsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             handleSlider(gSynthFeedbackSliderControl, SliderDragTarget::SynthFeedback) ||
             handleSlider(gSynthPitchSliderControl, SliderDragTarget::SynthPitch) ||
             handleSlider(gSynthPitchRangeSliderControl, SliderDragTarget::SynthPitchRange) ||
+            handleSlider(gSynthWavetablePositionSliderControl, SliderDragTarget::SynthWavetablePosition) ||
+            handleSlider(gSynthWavetableMixSliderControl, SliderDragTarget::SynthWavetableMix) ||
             handleSlider(gSynthAttackSliderControl, SliderDragTarget::SynthAttack) ||
             handleSlider(gSynthDecaySliderControl, SliderDragTarget::SynthDecay) ||
             handleSlider(gSynthSustainSliderControl, SliderDragTarget::SynthSustain) ||
@@ -5953,6 +6084,37 @@ LRESULT CALLBACK SampleParamsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 {
     switch (msg)
     {
+    case WM_CREATE:
+        CreateWindowExW(0, L"BUTTON", L"Drum mode", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_CHECKBOX,
+            12, 10, 140, 26, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSamplerDrumModeId)), GetModuleHandle(nullptr), nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Pitch mode", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_CHECKBOX,
+            164, 10, 140, 26, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSamplerPitchModeId)), GetModuleHandle(nullptr), nullptr);
+        CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_LEFT,
+            12,44,360,24,hwnd,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSamplerSelectionId)),GetModuleHandle(nullptr),nullptr);
+        SetTimer(hwnd,1,50,nullptr);
+        return 0;
+    case WM_TIMER:
+        InvalidateRect(hwnd,nullptr,FALSE);return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd,1);return 0;
+    case WM_GETMINMAXINFO:
+        reinterpret_cast<MINMAXINFO*>(lParam)->ptMinTrackSize={420,380};return 0;
+    case WM_COMMAND:
+        if (HIWORD(wParam) == BN_CLICKED && (LOWORD(wParam) == kSamplerDrumModeId || LOWORD(wParam) == kSamplerPitchModeId))
+        {
+            int trackId = getActiveSequencerTrackId();
+            if (trackGetType(trackId) == TrackType::Sample)
+            {
+                trackSetSampleDrumMode(trackId, LOWORD(wParam) == kSamplerDrumModeId);
+                gDrumRowOffset = 0;
+                pianoRollResetDrag();
+                pianoRollResetParamDrag();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                invalidatePianoRollWindow();
+            }
+            return 0;
+        }
+        break;
     case WM_MOUSEACTIVATE:
         return MA_ACTIVATE;
     case WM_LBUTTONDOWN:
@@ -5968,6 +6130,16 @@ LRESULT CALLBACK SampleParamsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         if (!activeTrack || activeTrack->type != TrackType::Sample || activeTrackId <= 0)
             return 0;
 
+        gSampleDragLane=trackGetSampleDrumMode(activeTrackId)?trackGetSelectedDrum(activeTrackId):-1;
+        if(gSampleDragLane>=0){
+            const std::pair<SliderControlRects*,SliderDragTarget> sliders[]={
+                {&gDrumPitchSliderControl,SliderDragTarget::DrumPitch},
+                {&gDrumPanSliderControl,SliderDragTarget::DrumPan},
+                {&gDrumVolumeSliderControl,SliderDragTarget::DrumVolume}};
+            for(const auto& entry:sliders)if(sliderHitTest(*entry.first,x,y)){
+                beginSliderDrag(hwnd,entry.second,activeTrackId);SetCapture(hwnd);updateSliderDrag(hwnd,x);return 0;
+            }
+        }
         if (sliderHitTest(gSampleAttackSliderControl, x, y))
         {
             beginSliderDrag(hwnd, SliderDragTarget::SampleAttack, activeTrackId);
@@ -6038,6 +6210,17 @@ LRESULT CALLBACK SampleParamsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
         Track fallback{};
         int activeTrackId = 0;
         const Track* activeTrack = getActiveTrackSnapshot(tracks, fallback, activeTrackId);
+        bool drumMode = trackGetSampleDrumMode(activeTrackId);
+        CheckDlgButton(hwnd, kSamplerDrumModeId, drumMode ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hwnd, kSamplerPitchModeId, drumMode ? BST_UNCHECKED : BST_CHECKED);
+        auto label=GetDlgItem(hwnd,kSamplerSelectionId);
+        ShowWindow(label,drumMode?SW_SHOWNA:SW_HIDE);
+        if(drumMode){
+            int lane=trackGetSelectedDrum(activeTrackId);
+            std::wstring selection=L"Selected drum: Sample "+std::to_wstring(lane+1);
+            wchar_t current[256]{};GetWindowTextW(label,current,256);
+            if(selection!=current)SetWindowTextW(label,selection.c_str());
+        }
         drawSampleTrackControls(surface, client, activeTrack);
         LICE_Scale_BitBlt(hdc, 0, 0, surface.getWidth(), surface.getHeight(), &surface, 0, 0, SRCCOPY);
         EndPaint(hwnd, &ps);
@@ -6066,7 +6249,7 @@ void openSynthParamsWindow(HWND parent)
     {
         gSynthParamsWindow = CreateWindowExW(WS_EX_TOOLWINDOW, L"KJSynthParamsWindow", L"Synth Params",
                                              WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
-                                             CW_USEDEFAULT, CW_USEDEFAULT, 420, 340, parent, nullptr,
+                                             CW_USEDEFAULT, CW_USEDEFAULT, 640, 440, parent, nullptr,
                                              GetModuleHandle(nullptr), nullptr);
     }
 }
@@ -6086,8 +6269,8 @@ void openSampleParamsWindow(HWND parent)
     if (!gSampleParamsWindow || !IsWindow(gSampleParamsWindow))
     {
         gSampleParamsWindow = CreateWindowExW(WS_EX_TOOLWINDOW, L"KJSampleParamsWindow", L"Sampler Params",
-                                              WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX,
-                                              CW_USEDEFAULT, CW_USEDEFAULT, 420, 160, parent, nullptr,
+                                              (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX & ~WS_MINIMIZEBOX) | WS_CLIPCHILDREN,
+                                              CW_USEDEFAULT, CW_USEDEFAULT, 420, 380, parent, nullptr,
                                               GetModuleHandle(nullptr), nullptr);
     }
 }
@@ -6095,7 +6278,6 @@ void openSampleParamsWindow(HWND parent)
 void renderUI(LICE_SysBitmap& surface, const RECT& client)
 {
     LICE_Clear(&surface, LICE_ColorFromCOLORREF(RGB(20, 20, 20)));
-    clearParameterControlRects();
     gAudioDeviceOptions.clear();
     gWaveOptions.clear();
     gMidiPortOptions.clear();
@@ -6161,6 +6343,10 @@ void renderUI(LICE_SysBitmap& surface, const RECT& client)
                 trackGetSynthOscRelease(activeTrackId, static_cast<int>(oscIndex));
             fallbackTrack.synthOscillators[oscIndex].wavetableEnabled =
                 trackGetSynthOscWavetableEnabled(activeTrackId, static_cast<int>(oscIndex));
+            fallbackTrack.synthOscillators[oscIndex].wavetablePosition =
+                trackGetSynthOscWavetablePosition(activeTrackId, static_cast<int>(oscIndex));
+            fallbackTrack.synthOscillators[oscIndex].wavetableMix =
+                trackGetSynthOscWavetableMix(activeTrackId, static_cast<int>(oscIndex));
         }
         fallbackTrack.sampleAttack = trackGetSampleAttack(activeTrackId);
         fallbackTrack.sampleRelease = trackGetSampleRelease(activeTrackId);
@@ -6387,8 +6573,6 @@ void renderUI(LICE_SysBitmap& surface, const RECT& client)
         }
     }
 
-    drawButton(surface, bpmDownButton, RGB(50, 50, 50), RGB(120, 120, 120), "-");
-    drawButton(surface, bpmUpButton, RGB(50, 50, 50), RGB(120, 120, 120), "+");
     drawButton(surface, stepCountDownButton, RGB(50, 50, 50), RGB(120, 120, 120), "-");
     drawButton(surface, stepCountUpButton, RGB(50, 50, 50), RGB(120, 120, 120), "+");
     drawButton(surface, pageDownButton, RGB(50, 50, 50), RGB(120, 120, 120), "<");
@@ -6398,10 +6582,10 @@ void renderUI(LICE_SysBitmap& surface, const RECT& client)
     bool pianoRollOpen = gPianoRollWindow && IsWindow(gPianoRollWindow);
     COLORREF pianoRollFill = pianoRollOpen ? RGB(0, 90, 160) : RGB(50, 50, 50);
     COLORREF pianoRollOutline = pianoRollOpen ? RGB(20, 20, 20) : RGB(120, 120, 120);
-    drawButton(surface, pianoRollToggleButton, pianoRollFill, pianoRollOutline,
+    if(trackGetType(activeTrackId)!=TrackType::AudioIn)drawButton(surface, pianoRollToggleButton, pianoRollFill, pianoRollOutline,
                pianoRollOpen ? "Hide Piano Roll" : "Show Piano Roll");
 
-    bool effectsOpen = gEffectsWindow && IsWindow(gEffectsWindow);
+    bool effectsOpen = isEditingPanelVisible(EditingPage::Fx);
     COLORREF effectsFill = effectsOpen ? RGB(0, 90, 160) : RGB(50, 50, 50);
     COLORREF effectsOutline = effectsOpen ? RGB(20, 20, 20) : RGB(120, 120, 120);
     drawButton(surface, effectsToggleButton, effectsFill, effectsOutline,
@@ -6462,11 +6646,14 @@ void renderUI(LICE_SysBitmap& surface, const RECT& client)
         }
     }
 
-    int bpm = sequencerBPM.load(std::memory_order_relaxed);
-    std::string bpmText = "Tempo: " + std::to_string(bpm) + " BPM";
-    RECT bpmRect {470, 20, client.right - 40, 50};
-    drawText(surface, bpmRect, bpmText.c_str(), RGB(220, 220, 220),
+    RECT bpmRect {470, 20, 525, 50};
+    drawText(surface, bpmRect, "Tempo", RGB(220, 220, 220),
              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    if (gTempoEdit && GetFocus() != gTempoEdit) {
+        wchar_t text[32]{};
+        GetWindowTextW(gTempoEdit, text, 32);
+        if (std::to_wstring(sequencerBPM.load(std::memory_order_relaxed)) != text) syncTempoControl();
+    }
 
     int totalSteps = getSequencerStepCount(activeTrackId);
     if (totalSteps < 1)
@@ -6592,15 +6779,66 @@ void renderUI(LICE_SysBitmap& surface, const RECT& client)
 
 } // namespace
 
+HWND createEmbeddedEffect(HWND parent,int effect,int track)
+{
+    if(effect==2)return createCompressorView(parent,track);
+    ensureEqWindowClass();ensureDelayWindowClass();ensureSidechainWindowClass();
+    const wchar_t* cls=effect==0?L"KJEqWindow":effect==1?L"KJDelayWindow":kSidechainWindowClassName;
+    HWND view=CreateWindowExW(WS_EX_CONTROLPARENT,cls,L"",WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN,
+        0,0,520,460,parent,nullptr,GetModuleHandle(nullptr),nullptr);
+    bindEmbeddedEffect(view,effect,track);return view;
+}
+void bindEmbeddedEffect(HWND view,int effect,int track)
+{
+    const UINT messages[]={WM_EQ_SET_TRACK,WM_DELAY_SET_TRACK,WM_COMPRESSOR_SET_TRACK,WM_SIDECHAIN_SET_TRACK};
+    SendMessageW(view,messages[std::clamp(effect,0,3)],track,0);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if(msg==WM_COMMAND && handleLfoPreferenceCommand(LOWORD(wParam)))return 0;
+    if(handleEditingPanelMessage(hwnd,msg,wParam,lParam))return 0;
+    if(msg>=WM_MOUSEFIRST && msg<=WM_MOUSELAST && msg!=WM_MOUSEWHEEL && msg!=WM_MOUSEHWHEEL) {
+        RECT area=sequencerContentRect(hwnd);
+        if(GET_Y_LPARAM(lParam)>=area.bottom && GetCapture()!=hwnd)return 0;
+    }
     switch (msg)
     {
+    case WM_NOTIFY:
+    {
+        const auto* notification = reinterpret_cast<const NMHDR*>(lParam);
+        if (notification && notification->hwndFrom == gTempoSpin && notification->code == UDN_DELTAPOS) {
+            const auto* delta = reinterpret_cast<const NMUPDOWN*>(lParam);
+            commitTempoControl();
+            int bpm = std::clamp(sequencerBPM.load(std::memory_order_relaxed) + delta->iDelta, 40, 240);
+            sequencerBPM.store(bpm, std::memory_order_relaxed);
+            SendMessageW(gTempoSpin, UDM_SETPOS32, 0, bpm);
+            syncTempoControl();
+            return TRUE;
+        }
+        break;
+    }
     case WM_CREATE:
         gMainWindow = hwnd;
+        {
+            INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_UPDOWN_CLASS};
+            InitCommonControlsEx(&controls);
+            gTempoEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER | ES_RIGHT,
+                530, 22, 90, 26, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTempoEditId)), GetModuleHandle(nullptr), nullptr);
+            SendMessageW(gTempoEdit, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+            SendMessageW(gTempoEdit, EM_SETLIMITTEXT, 3, 0);
+            gTempoSpin = CreateWindowExW(0, UPDOWN_CLASSW, L"", WS_CHILD | WS_VISIBLE | UDS_ALIGNRIGHT | UDS_SETBUDDYINT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
+                0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTempoSpinId)), GetModuleHandle(nullptr), nullptr);
+            SendMessageW(gTempoSpin, UDM_SETBUDDY, reinterpret_cast<WPARAM>(gTempoEdit), 0);
+            SendMessageW(gTempoSpin, UDM_SETRANGE32, 40, 240);
+            SendMessageW(gTempoSpin, UDM_SETPOS32, 0, sequencerBPM.load(std::memory_order_relaxed));
+            SetWindowSubclass(gTempoEdit, TempoEditProc, 1, 0);
+        }
         buildStepRects();
         openSynthParamsWindow(hwnd);
         openSampleParamsWindow(hwnd);
+        openSampleBankWindow(hwnd);
+        createEditingPanel(hwnd);
         updateParamWindowsVisibility();
         // UI heartbeat timer (~66 fps)
         SetTimer(hwnd, 1, 15, nullptr);
@@ -6614,6 +6852,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 {
                     AppendMenuW(fileMenu, MF_STRING, kMenuCommandLoadProject, L"&Load Project...");
                     AppendMenuW(fileMenu, MF_STRING, kMenuCommandSaveProject, L"&Save Project...");
+                    AppendMenuW(fileMenu, MF_SEPARATOR, 0, nullptr);
+                    AppendMenuW(fileMenu, MF_STRING, kMenuCommandRecord, L"&Record...");
                     AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(fileMenu), L"&File");
                 }
 
@@ -6623,15 +6863,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     gViewMenu = viewMenu;
                     AppendMenuW(viewMenu, MF_STRING, kMenuCommandTogglePianoRoll, L"&Piano Roll");
                     AppendMenuW(viewMenu, MF_STRING, kMenuCommandToggleEffects, L"Track &Effects");
+                    AppendMenuW(viewMenu, MF_STRING, 6330, L"&Mixer");
                     AppendMenuW(viewMenu, MF_STRING, kMenuCommandToggleWaveform, L"&Waveform Visualizer");
                     AppendMenuW(viewMenu, MF_STRING, kMenuCommandToggleModMatrix, L"&Mod Matrix");
                     AppendMenuW(menuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(viewMenu), L"&View");
+#ifdef KJ_ENABLE_VST3
+                    appendVst3Menu(menuBar);
+#endif
                     updateViewMenuChecks();
                 }
                 else
                 {
                     gViewMenu = nullptr;
                 }
+                appendLfoPreferences(menuBar);
                 SetMenu(hwnd, menuBar);
                 DrawMenuBar(hwnd);
             }
@@ -6641,18 +6886,58 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         switch (LOWORD(wParam))
         {
+#ifdef KJ_ENABLE_VST3
+        case kMenuVst3Instrument:
+        case kMenuVst3Effect:
+        case kMenuVst3UnloadInstrument:
+        case kMenuVst3UnloadEffect:
+        case kMenuVst3EditInstrument:
+        case kMenuVst3EditEffect:
+        case kMenuVst3Rack:
+        case kMenuVst3Refresh:
+            handleVst3Menu(hwnd, LOWORD(wParam), getActiveSequencerTrackId());
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+#endif
         case kMenuCommandLoadProject:
+            if (gTempoEdit) commitTempoControl();
             showLoadProjectDialog(hwnd);
+            syncTempoControl();
             return 0;
         case kMenuCommandSaveProject:
             showSaveProjectDialog(hwnd);
             return 0;
+        case kMenuCommandRecord:
+        {
+            std::wstring error;
+            if (isAudioRecording()) stopAudioRecording(error);
+            else
+            {
+                wchar_t path[MAX_PATH] = L"Recording.wav";
+                OPENFILENAMEW dialog{};
+                dialog.lStructSize = sizeof(dialog);
+                dialog.hwndOwner = hwnd;
+                dialog.lpstrFilter = L"WAV audio (*.wav)\0*.wav\0";
+                dialog.lpstrFile = path;
+                dialog.nMaxFile = MAX_PATH;
+                dialog.lpstrDefExt = L"wav";
+                dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+                if (GetSaveFileNameW(&dialog)) startAudioRecording(std::filesystem::path(path), error);
+            }
+            HMENU fileMenu = GetSubMenu(GetMenu(hwnd), 0);
+            ModifyMenuW(fileMenu, kMenuCommandRecord, MF_BYCOMMAND | MF_STRING, kMenuCommandRecord,
+                isAudioRecording() ? L"&Stop Recording" : L"&Record...");
+            DrawMenuBar(hwnd);
+            if (!error.empty()) MessageBoxW(hwnd, error.c_str(), L"Recording", MB_OK | MB_ICONERROR);
+            return 0;
+        }
         case kMenuCommandTogglePianoRoll:
             togglePianoRollWindow(hwnd);
             return 0;
         case kMenuCommandToggleEffects:
             toggleEffectsWindow(hwnd);
             return 0;
+        case 6330: showMixerWindow(hwnd); return 0;
         case kMenuCommandToggleWaveform:
             toggleWaveformWindow(hwnd);
             return 0;
@@ -6709,50 +6994,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
         }
 
-        if (pointInRect(audioDeviceButton, x, y))
-        {
-            audioDeviceDropdownOpen = !audioDeviceDropdownOpen;
-            if (audioDeviceDropdownOpen)
-            {
-                refreshAudioDeviceList(true);
-            }
-            waveDropdownOpen = false;
-            waveDropdownTrackId = 0;
-            midiPortDropdownOpen = false;
-            midiPortDropdownTrackId = 0;
-            midiChannelDropdownOpen = false;
-            midiChannelDropdownTrackId = 0;
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-
-        if (pointInRect(pianoRollToggleButton, x, y))
-        {
-            togglePianoRollWindow(hwnd);
-            audioDeviceDropdownOpen = false;
-            waveDropdownOpen = false;
-            waveDropdownTrackId = 0;
-            midiPortDropdownOpen = false;
-            midiPortDropdownTrackId = 0;
-            midiChannelDropdownOpen = false;
-            midiChannelDropdownTrackId = 0;
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-
-        if (pointInRect(effectsToggleButton, x, y))
-        {
-            toggleEffectsWindow(hwnd);
-            audioDeviceDropdownOpen = false;
-            waveDropdownOpen = false;
-            waveDropdownTrackId = 0;
-            midiPortDropdownOpen = false;
-            midiPortDropdownTrackId = 0;
-            midiChannelDropdownOpen = false;
-            midiChannelDropdownTrackId = 0;
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
 
         auto tracks = getTracks();
         ensureTrackTabState(tracks);
@@ -6930,6 +7171,52 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             {
                 return 0;
             }
+        }
+
+        // Open dropdowns consume their clicks before any controls beneath them.
+        if (pointInRect(audioDeviceButton, x, y))
+        {
+            audioDeviceDropdownOpen = !audioDeviceDropdownOpen;
+            if (audioDeviceDropdownOpen)
+            {
+                refreshAudioDeviceList(true);
+            }
+            waveDropdownOpen = false;
+            waveDropdownTrackId = 0;
+            midiPortDropdownOpen = false;
+            midiPortDropdownTrackId = 0;
+            midiChannelDropdownOpen = false;
+            midiChannelDropdownTrackId = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        if (pointInRect(pianoRollToggleButton, x, y))
+        {
+            togglePianoRollWindow(hwnd);
+            audioDeviceDropdownOpen = false;
+            waveDropdownOpen = false;
+            waveDropdownTrackId = 0;
+            midiPortDropdownOpen = false;
+            midiPortDropdownTrackId = 0;
+            midiChannelDropdownOpen = false;
+            midiChannelDropdownTrackId = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        if (pointInRect(effectsToggleButton, x, y))
+        {
+            toggleEffectsWindow(hwnd);
+            audioDeviceDropdownOpen = false;
+            waveDropdownOpen = false;
+            waveDropdownTrackId = 0;
+            midiPortDropdownOpen = false;
+            midiPortDropdownTrackId = 0;
+            midiChannelDropdownOpen = false;
+            midiChannelDropdownTrackId = 0;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
         }
 
         if (showMidiPortSelector && pointInRect(midiPortButton, x, y))
@@ -7125,7 +7412,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (GetOpenFileNameW(&ofn))
             {
                 std::filesystem::path selectedPath(fileBuffer);
-                if (activeTrackId <= 0 || !loadSampleFile(activeTrackId, selectedPath))
+                if (activeTrackId <= 0 || !addSampleToBank(activeTrackId, selectedPath))
                 {
                     MessageBoxW(hwnd,
                                 L"Failed to load selected sample.",
@@ -7138,23 +7425,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
 
-        if (pointInRect(bpmDownButton, x, y))
-        {
-            int bpm = sequencerBPM.load(std::memory_order_relaxed);
-            bpm = std::clamp(bpm - 5, 40, 240);
-            sequencerBPM.store(bpm, std::memory_order_relaxed);
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-
-        if (pointInRect(bpmUpButton, x, y))
-        {
-            int bpm = sequencerBPM.load(std::memory_order_relaxed);
-            bpm = std::clamp(bpm + 5, 40, 240);
-            sequencerBPM.store(bpm, std::memory_order_relaxed);
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
 
         if (pointInRect(stepCountDownButton, x, y))
         {
@@ -7239,7 +7509,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         for (int i = 0; i < kSequencerStepsPerPage; ++i)
         {
-            if (pointInRect(stepRects[i], x, y))
+            if (trackGetType(getActiveSequencerTrackId())!=TrackType::AudioIn && pointInRect(stepRects[i], x, y))
             {
                 int stepIndex = currentStepPage * kSequencerStepsPerPage + i;
                 int totalSteps = getSequencerStepCount(activeTrackId);
@@ -7293,6 +7563,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             endSliderDrag(hwnd);
         break;
     case WM_TIMER:
+#ifdef KJ_ENABLE_VST3
+        serviceVst3MainThread(hwnd);
+        if (auto error = kj::takeTrackVst3Error(); !error.empty())
+            MessageBoxA(hwnd, error.c_str(), "VST3 processing stopped", MB_OK | MB_ICONERROR);
+#endif
     {
         AudioThreadNotification notification{};
         while (consumeAudioThreadNotification(notification))
@@ -7315,6 +7590,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         int width = LOWORD(lParam);
         int height = HIWORD(lParam);
+        layoutEditingPanel(hwnd);
         ensureSurfaceSize(width, height);
         buildStepRects();
         snapParamWindowsToMain();
@@ -7333,8 +7609,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         ensureSurfaceSize(client.right, client.bottom);
         if (gSurface)
         {
-            renderUI(*gSurface, client);
-            LICE_Scale_BitBlt(hdc, 0, 0, gSurface->getWidth(), gSurface->getHeight(), gSurface.get(), 0, 0, SRCCOPY); // Use LICE helper to blit the surface to the window HDC.
+            RECT content=sequencerContentRect(hwnd);
+            renderUI(*gSurface, content);
+            drawEditingPanel(*gSurface);
+            SaveDC(hdc);
+            LICE_Scale_BitBlt(hdc, 0, 0, gSurface->getWidth(), gSurface->getHeight(), gSurface.get(), 0, 0, SRCCOPY);
+            RestoreDC(hdc,-1);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -7346,6 +7626,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         gViewMenu = nullptr;
         closePianoRollWindow();
         closeEffectsWindow();
+        closeMixerWindow();
         closeWaveformWindow();
         closeCompressorWindow();
         if (gEqWindow && IsWindow(gEqWindow))
@@ -7358,6 +7639,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             DestroyWindow(gSynthParamsWindow);
         if (gSampleParamsWindow && IsWindow(gSampleParamsWindow))
             DestroyWindow(gSampleParamsWindow);
+        if (gSampleBankWindow && IsWindow(gSampleBankWindow))
+            DestroyWindow(gSampleBankWindow);
+        gSampleBank.clear();
+        sampleSetBankBuffers(std::make_shared<const SampleBankBuffers>());
         PostQuitMessage(0);
         return 0;
     }
@@ -7372,6 +7657,7 @@ void initGUI()
     InitCommonControlsEx(&icc);
 
     WNDCLASSW wc = {0};
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandle(nullptr);
     wc.lpszClassName = L"KJWDLWindow";
@@ -7395,6 +7681,10 @@ void initGUI()
     MSG msg = {0};
     while (GetMessageW(&msg, nullptr, 0, 0))
     {
+        if (handleModMatrixKeyboard(&msg))
+            continue;
+        if (handleEditingPanelKeyboard(&msg))
+            continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

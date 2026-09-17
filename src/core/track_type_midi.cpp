@@ -28,7 +28,6 @@ void trackSetMidiChannel(int trackId, int channel)
 
     int clamped = std::clamp(channel, kMinMidiChannel, kMaxMidiChannel);
     track->midiChannel.store(clamped, std::memory_order_relaxed);
-    track->track.midiChannel = clamped;
 }
 
 int trackGetMidiPort(int trackId)
@@ -60,12 +59,10 @@ void trackSetMidiPort(int trackId, int portId, const std::wstring& portName)
     if (sanitized < kDefaultMidiPort)
         sanitized = kDefaultMidiPort;
 
-    track->midiPort.store(sanitized, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(track->midiPortMutex);
         track->midiPortName = portName;
+        track->midiPort.store(sanitized, std::memory_order_relaxed);
     }
-    track->track.midiPort = sanitized;
-    track->track.midiPortName = portName;
 }
 

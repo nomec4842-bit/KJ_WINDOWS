@@ -1,6 +1,8 @@
 #pragma once
 
 #include <optional>
+#include <string>
+#include <cstdint>
 #include <vector>
 
 struct ModMatrixAssignment
@@ -10,6 +12,9 @@ struct ModMatrixAssignment
     int trackId = 0;
     int parameterIndex = 0;
     float normalizedAmount = 0.0f;
+    std::string vstSlotId; // Empty means a native KJ target.
+    std::uint32_t vstParameterId = 0;
+    std::string vstParameterName;
 };
 
 std::vector<ModMatrixAssignment> modMatrixGetAssignments();

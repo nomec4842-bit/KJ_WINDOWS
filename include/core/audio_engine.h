@@ -7,7 +7,11 @@
 #include <vector>
 
 extern std::atomic<bool> isPlaying;
-void initAudio();
+void initAudio(bool loadDefaultSample = true);
+double getAudioSampleRate();
+bool isAudioRunning();
+// True for one second after the final stereo mix exceeds full scale.
+bool isAudioOutputClipping();
 void shutdownAudio();
 bool loadSampleFile(int trackId, const std::filesystem::path& path);
 

@@ -1,3 +1,5 @@
+#include "core/tracks.h"
+#include "core/sequencer.h"
 #include "gui/gui_refresh.h"
 #include "gui/menu_commands.h"
 #include "gui/mod_matrix_window.h"
@@ -21,6 +23,7 @@ void updateViewMenuChecks()
     if (!gViewMenu)
         return;
 
+    EnableMenuItem(gViewMenu,kMenuCommandTogglePianoRoll,MF_BYCOMMAND|(trackGetType(getActiveSequencerTrackId())==TrackType::AudioIn?MF_GRAYED:MF_ENABLED));
     UINT pianoState = (gPianoRollWindow && IsWindow(gPianoRollWindow)) ? MF_CHECKED : MF_UNCHECKED;
     CheckMenuItem(gViewMenu, kMenuCommandTogglePianoRoll, MF_BYCOMMAND | pianoState);
 

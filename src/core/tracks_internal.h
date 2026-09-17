@@ -80,8 +80,8 @@ inline constexpr float kDefaultSampleRelease = 0.3f;
 inline constexpr float kMinLfoRateHz = 0.05f;
 inline constexpr float kMaxLfoRateHz = 20.0f;
 inline constexpr float kDefaultLfoDeform = 0.0f;
-inline constexpr std::array<float, 3> kDefaultLfoRatesHz = {0.5f, 1.0f, 2.0f};
-inline constexpr std::array<LfoShape, 3> kDefaultLfoShapes = {LfoShape::Sine, LfoShape::Sine, LfoShape::Sine};
+inline constexpr auto kDefaultLfoRatesHz = [] {std::array<float,kMaxLfos> rates{};for(int i=0;i<kMaxLfos;++i)rates[i]=i==0?.5f:i==2?2.f:1.f;return rates;}();
+inline constexpr std::array<LfoShape, kMaxLfos> kDefaultLfoShapes{};
 inline constexpr int kMinMidiNote = 0;
 inline constexpr int kMaxMidiNote = 127;
 inline constexpr int kDefaultMidiNote = 69; // A4
@@ -105,6 +105,7 @@ struct TrackData
     explicit TrackData(Track baseTrack);
 
     Track track;
+    kj::Vst3RackState vst3;
     std::atomic<TrackType> type{TrackType::Synth};
     std::atomic<SynthWaveType> waveType{SynthWaveType::Sine};
     std::atomic<float> volume{1.0f};
@@ -112,7 +113,10 @@ struct TrackData
     std::atomic<float> lowGainDb{0.0f};
     std::atomic<float> midGainDb{0.0f};
     std::atomic<float> highGainDb{0.0f};
-    std::atomic<bool> eqEnabled{true};
+    std::atomic<bool> eqEnabled{false};
+    std::array<std::atomic<float>, 3> eqFrequency{{200.0f, 1000.0f, 5000.0f}};
+    std::array<std::atomic<int>, 3> eqShape{{1, 0, 0}};
+    std::array<std::atomic<float>, 3> eqQ{{0.707f, 0.707f, 0.707f}};
     std::atomic<bool> delayEnabled{false};
     std::atomic<float> delayTimeMs{kDefaultDelayTimeMs};
     std::atomic<float> delayFeedback{kDefaultDelayFeedback};
@@ -148,6 +152,8 @@ struct TrackData
     std::array<std::atomic<float>, kSynthOscillatorCount> synthOscSustain;
     std::array<std::atomic<float>, kSynthOscillatorCount> synthOscRelease;
     std::array<std::atomic<bool>, kSynthOscillatorCount> synthOscWavetableEnabled;
+    std::array<std::atomic<float>, kSynthOscillatorCount> synthOscWavetablePosition;
+    std::array<std::atomic<float>, kSynthOscillatorCount> synthOscWavetableMix;
     std::atomic<float> sampleAttack{kDefaultSampleAttack};
     std::atomic<float> sampleRelease{kDefaultSampleRelease};
     std::array<std::atomic<float>, kDefaultLfoRatesHz.size()> lfoRateHz;
@@ -168,6 +174,7 @@ struct TrackData
     std::atomic<int> stepCount{1};
     std::atomic<int> maxInitializedStepCount{kSequencerStepsPerPage};
     std::shared_ptr<const SampleBuffer> sampleBuffer;
+    std::atomic<bool> sampleDrumMode{false};
     std::mutex noteMutex;
     std::atomic<int> midiChannel{kDefaultMidiChannel};
     std::atomic<int> midiPort{kDefaultMidiPort};
@@ -190,7 +197,7 @@ inline TrackData::TrackData(Track baseTrack)
     track.lowGainDb = 0.0f;
     track.midGainDb = 0.0f;
     track.highGainDb = 0.0f;
-    track.eqEnabled = true;
+    track.eqEnabled = false;
     track.delayEnabled = false;
     track.delayTimeMs = kDefaultDelayTimeMs;
     track.delayFeedback = kDefaultDelayFeedback;
@@ -261,6 +268,8 @@ inline TrackData::TrackData(Track baseTrack)
         synthOscSustain[i].store(kDefaultSynthSustain, std::memory_order_relaxed);
         synthOscRelease[i].store(kDefaultSynthRelease, std::memory_order_relaxed);
         synthOscWavetableEnabled[i].store(kDefaultSynthWavetableEnabled, std::memory_order_relaxed);
+        synthOscWavetablePosition[i].store(0.0f, std::memory_order_relaxed);
+        synthOscWavetableMix[i].store(1.0f, std::memory_order_relaxed);
     }
     for (int i = 0; i < kMaxSequencerSteps; ++i)
     {

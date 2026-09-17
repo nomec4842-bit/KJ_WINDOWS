@@ -5,6 +5,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <objbase.h>
+#ifdef KJ_ENABLE_VST3
+#include "hosting/TrackVST3.h"
+#endif
 #include <string>
 #include "core/audio_engine.h"
 #include "core/sequencer.h"
@@ -34,6 +38,7 @@ void configureProcessDpiAwareness()
 }
 
 int main() {
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     configureProcessDpiAwareness();
     logStartupEvent(L"KJ started.");
     initTracks();
@@ -43,5 +48,9 @@ int main() {
     initGUI();
     logStartupEvent(L"GUI initialized.");
     shutdownAudio();
+#ifdef KJ_ENABLE_VST3
+    kj::clearTrackVst3();
+#endif
+    if (SUCCEEDED(comResult)) CoUninitialize();
     return 0;
 }

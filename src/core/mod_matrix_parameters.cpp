@@ -96,13 +96,26 @@ void setSynthOsc1Release(int trackId, float value) { trackSetSynthOscRelease(tra
 void setSynthOsc2Release(int trackId, float value) { trackSetSynthOscRelease(trackId, 1, value); }
 void setSynthOsc3Release(int trackId, float value) { trackSetSynthOscRelease(trackId, 2, value); }
 
+float getSynthOsc1WavetablePosition(int track) { return trackGetSynthOscWavetablePosition(track, 0); }
+void setSynthOsc1WavetablePosition(int track, float value) { trackSetSynthOscWavetablePosition(track, 0, value); }
+float getSynthOsc1WavetableMix(int track) { return trackGetSynthOscWavetableMix(track, 0); }
+void setSynthOsc1WavetableMix(int track, float value) { trackSetSynthOscWavetableMix(track, 0, value); }
+float getSynthOsc2WavetablePosition(int track) { return trackGetSynthOscWavetablePosition(track, 1); }
+void setSynthOsc2WavetablePosition(int track, float value) { trackSetSynthOscWavetablePosition(track, 1, value); }
+float getSynthOsc2WavetableMix(int track) { return trackGetSynthOscWavetableMix(track, 1); }
+void setSynthOsc2WavetableMix(int track, float value) { trackSetSynthOscWavetableMix(track, 1, value); }
+float getSynthOsc3WavetablePosition(int track) { return trackGetSynthOscWavetablePosition(track, 2); }
+void setSynthOsc3WavetablePosition(int track, float value) { trackSetSynthOscWavetablePosition(track, 2, value); }
+float getSynthOsc3WavetableMix(int track) { return trackGetSynthOscWavetableMix(track, 2); }
+void setSynthOsc3WavetableMix(int track, float value) { trackSetSynthOscWavetableMix(track, 2, value); }
+
 struct ModParameterEntry
 {
     ModMatrixParameter id;
     ModParameterInfo info;
 };
 
-constexpr std::array<ModParameterEntry, 46> kModParameters = {
+constexpr std::array<ModParameterEntry, 52> kModParameters = {
     ModParameterEntry{ModMatrixParameter::Volume,
                       ModParameterInfo{L"Volume", trackGetVolume, trackSetVolume, 0.0f, 1.0f, kTrackTypeMaskAll}},
     ModParameterEntry{ModMatrixParameter::Pan,
@@ -238,6 +251,18 @@ constexpr std::array<ModParameterEntry, 46> kModParameters = {
     ModParameterEntry{ModMatrixParameter::CompressorRatio,
                       ModParameterInfo{L"Compressor Ratio", trackGetCompressorRatio, trackSetCompressorRatio, 1.0f, 20.0f,
                                        kTrackTypeMaskAll}},
+    ModParameterEntry{ModMatrixParameter::SynthOsc1WavetablePosition,
+        ModParameterInfo{L"Osc 1 WT Position", getSynthOsc1WavetablePosition, setSynthOsc1WavetablePosition, 0.0f, 3.0f, kTrackTypeMaskSynth}},
+    ModParameterEntry{ModMatrixParameter::SynthOsc1WavetableMix,
+        ModParameterInfo{L"Osc 1 WT Mix", getSynthOsc1WavetableMix, setSynthOsc1WavetableMix, 0.0f, 1.0f, kTrackTypeMaskSynth}},
+    ModParameterEntry{ModMatrixParameter::SynthOsc2WavetablePosition,
+        ModParameterInfo{L"Osc 2 WT Position", getSynthOsc2WavetablePosition, setSynthOsc2WavetablePosition, 0.0f, 3.0f, kTrackTypeMaskSynth}},
+    ModParameterEntry{ModMatrixParameter::SynthOsc2WavetableMix,
+        ModParameterInfo{L"Osc 2 WT Mix", getSynthOsc2WavetableMix, setSynthOsc2WavetableMix, 0.0f, 1.0f, kTrackTypeMaskSynth}},
+    ModParameterEntry{ModMatrixParameter::SynthOsc3WavetablePosition,
+        ModParameterInfo{L"Osc 3 WT Position", getSynthOsc3WavetablePosition, setSynthOsc3WavetablePosition, 0.0f, 3.0f, kTrackTypeMaskSynth}},
+    ModParameterEntry{ModMatrixParameter::SynthOsc3WavetableMix,
+        ModParameterInfo{L"Osc 3 WT Mix", getSynthOsc3WavetableMix, setSynthOsc3WavetableMix, 0.0f, 1.0f, kTrackTypeMaskSynth}},
 };
 
 } // namespace
@@ -268,6 +293,17 @@ bool modMatrixParameterSupportsTrackType(const ModParameterInfo& info, TrackType
 {
     uint32_t mask = modMatrixTrackTypeToMask(trackType);
     return (info.trackTypeMask & mask) != 0;
+}
+
+bool modMatrixParameterAvailableForTrack(int index, const Track& track)
+{
+    const auto* info = modMatrixGetParameterInfo(index);
+    if (!info || !modMatrixParameterSupportsTrackType(*info, track.type)) return false;
+    const int first = modMatrixGetParameterIndex(ModMatrixParameter::SynthOsc1WavetablePosition);
+    if (index >= first && index < first + 6)
+        return track.synthOscillators[0].wavetableEnabled &&
+               (index < first + 2 || track.synthThreeOscEnabled);
+    return true;
 }
 
 float modMatrixClampNormalized(float normalized)

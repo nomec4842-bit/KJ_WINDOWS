@@ -176,6 +176,7 @@ void AudioDeviceHandler::resetStateLocked() {
     mixFormat_.reset();
     bufferFrameCount_ = 0;
     initialized_ = false;
+    requestedDeviceId_.clear();
     deviceId_.clear();
     deviceName_.clear();
     activeRenderBuffer_ = nullptr;
@@ -255,7 +256,7 @@ bool AudioDeviceHandler::initialize(const std::wstring& deviceId) {
     }
 
     if (initialized_) {
-        if ((deviceId.empty() && deviceId_.empty()) || (!deviceId.empty() && deviceId == deviceId_)) {
+        if (deviceId == requestedDeviceId_) {
             return true;
         }
     }
@@ -543,6 +544,7 @@ bool AudioDeviceHandler::runInitialization(const std::wstring& deviceId) {
             client_ = client;
             renderClient_ = renderClient;
             initialized_ = true;
+            requestedDeviceId_ = deviceId;
             deviceId_ = std::move(resolvedDeviceId);
             if (deviceId_.empty()) {
                 deviceId_ = deviceId;
@@ -871,6 +873,7 @@ void AudioDeviceHandler::resetStateLocked() {
     mixFormat_.reset();
     bufferFrameCount_ = 0;
     initialized_ = false;
+    requestedDeviceId_.clear();
     deviceId_.clear();
     deviceName_.clear();
     activeRenderBuffer_ = nullptr;

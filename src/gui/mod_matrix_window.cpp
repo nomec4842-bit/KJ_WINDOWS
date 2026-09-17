@@ -1,4 +1,5 @@
 #include "gui/mod_matrix_window.h"
+#include "gui/editing_panel.h"
 
 #include "core/mod_matrix.h"
 #include "core/sequencer.h"
@@ -39,8 +40,8 @@ namespace
 {
 
 constexpr wchar_t kModMatrixWindowClassName[] = L"KJModMatrixWindow";
-constexpr int kModMatrixWindowWidth = 520;
-constexpr int kModMatrixWindowHeight = 420;
+constexpr int kModMatrixWindowWidth = 720;
+constexpr int kModMatrixWindowHeight = 580;
 
 constexpr UINT WM_MOD_MATRIX_REFRESH_TRACKS = WM_APP + 120;
 constexpr UINT WM_MOD_MATRIX_REFRESH_VALUES = WM_APP + 121;
@@ -54,6 +55,8 @@ constexpr int kAmountLabelId = 2006;
 constexpr int kAmountSliderId = 2007;
 constexpr int kAmountEditId = 2008;
 constexpr int kLfoButtonId = 2009;
+constexpr int kTrackComboId = 2010;
+constexpr int kResetAmountId = 2011;
 
 constexpr int kComboDropdownHeight = 200;
 
@@ -80,6 +83,14 @@ bool gModMatrixWindowClassRegistered = false;
 struct ModMatrixWindowState
 {
     HWND listView = nullptr;
+    HWND trackCombo = nullptr;
+    HWND sourceLabel = nullptr;
+    HWND trackLabel = nullptr;
+    HWND parameterLabel = nullptr;
+    HWND editorLabel = nullptr;
+    HWND hintLabel = nullptr;
+    HWND resetAmountButton = nullptr;
+    bool rebuildingList = false;
     HWND addButton = nullptr;
     HWND removeButton = nullptr;
     HWND sourceCombo = nullptr;
@@ -89,6 +100,8 @@ struct ModMatrixWindowState
     HWND amountEdit = nullptr;
     HWND lfoButton = nullptr;
     int selectedAssignmentId = 0;
+    int boundTrack = 0;
+    bool embedded = false;
 };
 
 INITCOMMONCONTROLSEX gModMatrixInitControls = {};
@@ -176,7 +189,7 @@ void addAssignment(ModMatrixWindowState* state)
     ModMatrixAssignment assignment = modMatrixCreateAssignment();
     assignment.sourceIndex = 0;
     assignment.parameterIndex = 0;
-    assignment.trackId = getActiveSequencerTrackId();
+    assignment.trackId = state && state->embedded ? state->boundTrack : getActiveSequencerTrackId();
     if (assignment.trackId <= 0)
     {
         auto tracks = getTracks();
@@ -208,13 +221,14 @@ void populateSourceCombo(HWND combo)
     }
 }
 
-void populateParameterCombo(HWND combo, std::optional<TrackType> trackType = std::nullopt)
+void populateParameterCombo(HWND combo, std::optional<TrackType> trackType = std::nullopt, int trackId = -1)
 {
     if (!combo)
         return;
 
     SendMessageW(combo, CB_RESETCONTENT, 0, 0);
     int parameterCount = modMatrixGetParameterCount();
+    const auto tracks = getTracks();
     for (int i = 0; i < parameterCount; ++i)
     {
         const ModParameterInfo* info = modMatrixGetParameterInfo(i);
@@ -228,9 +242,24 @@ void populateParameterCombo(HWND combo, std::optional<TrackType> trackType = std
         }
 
         const wchar_t* label = info->label;
+        bool available = false;
+        for (const auto& track : tracks)
+            if (track.id == trackId) { available = modMatrixParameterAvailableForTrack(i, track); break; }
+        if (trackId >= 0 && !available) continue;
         LRESULT index = SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
         if (index >= 0)
             SendMessageW(combo, CB_SETITEMDATA, static_cast<WPARAM>(index), static_cast<LPARAM>(i));
+    }
+}
+
+void populateTrackCombo(HWND combo)
+{
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    for (const auto& track : getTracks())
+    {
+        auto label = getTrackLabel(track.id);
+        LRESULT row = SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        if (row >= 0) SendMessageW(combo, CB_SETITEMDATA, row, track.id);
     }
 }
 
@@ -351,15 +380,12 @@ void repopulateAssignmentList(ModMatrixWindowState* state)
     if (!state || !state->listView)
         return;
 
+    state->rebuildingList = true;
     ListView_DeleteAllItems(state->listView);
 
     auto assignments = modMatrixGetAssignments();
-
-    if (assignments.empty())
-    {
-        addAssignment(state);
-        assignments = modMatrixGetAssignments();
-    }
+    if(state->embedded) assignments.erase(std::remove_if(assignments.begin(),assignments.end(),
+        [&](const ModMatrixAssignment& a){return a.trackId!=state->boundTrack;}),assignments.end());
 
     for (size_t i = 0; i < assignments.size(); ++i)
     {
@@ -382,6 +408,8 @@ void repopulateAssignmentList(ModMatrixWindowState* state)
     if (assignments.empty())
     {
         state->selectedAssignmentId = 0;
+        state->rebuildingList = false;
+        SetWindowTextW(state->editorLabel, L"No assignments. Use + Add assignment to create a route.");
         return;
     }
 
@@ -405,6 +433,8 @@ void repopulateAssignmentList(ModMatrixWindowState* state)
         state->selectedAssignmentId = assignments.front().id;
         ListView_SetItemState(state->listView, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     }
+    state->rebuildingList = false;
+    SetWindowTextW(state->editorLabel, L"Selected assignment");
 }
 
 bool updateAssignmentAmountFromEdit(ModMatrixWindowState* state)
@@ -446,7 +476,7 @@ bool updateAssignmentAmountFromEdit(ModMatrixWindowState* state)
 
         wchar_t* endPtr = nullptr;
         float value = std::wcstof(text.c_str(), &endPtr);
-        if (endPtr == text.c_str())
+        if (endPtr == text.c_str() || *endPtr != L'\0' || !std::isfinite(value))
         {
             setEditFromAssignment(state->amountEdit, *assignment);
             return false;
@@ -479,6 +509,8 @@ void enableAssignmentControls(ModMatrixWindowState* state, bool enable)
 
     const HWND controls[] = {
         state->sourceCombo,
+        state->trackCombo,
+        state->resetAmountButton,
         state->parameterCombo,
         state->amountLabel,
         state->amountSlider,
@@ -511,6 +543,10 @@ void loadAssignmentIntoControls(ModMatrixWindowState* state, int assignmentId)
     {
         populateSourceCombo(state->sourceCombo);
         populateParameterCombo(state->parameterCombo);
+        populateTrackCombo(state->trackCombo);
+        SendMessageW(state->sourceCombo, CB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+        SendMessageW(state->trackCombo, CB_SETCURSEL, static_cast<WPARAM>(-1), 0);
+        SendMessageW(state->amountSlider, TBM_SETPOS, TRUE, kSliderResolution / 2);
         enableAssignmentControls(state, false);
         SetWindowTextW(state->amountLabel, L"Mod Amount:");
         if (state->amountEdit)
@@ -559,12 +595,16 @@ void loadAssignmentIntoControls(ModMatrixWindowState* state, int assignmentId)
         }
     }
 
+    populateTrackCombo(state->trackCombo);
+    setComboSelectionByData(state->trackCombo, assignment->trackId);
+    if(state->embedded) EnableWindow(state->trackCombo,FALSE);
     auto trackType = getTrackTypeForTrack(assignment->trackId);
-    populateParameterCombo(state->parameterCombo, trackType);
+    populateParameterCombo(state->parameterCombo, trackType, assignment->trackId);
 
     bool parameterSelectionSet = setComboSelectionByData(state->parameterCombo, assignment->parameterIndex);
     bool parameterChanged = false;
-    if (!parameterSelectionSet)
+    if (!parameterSelectionSet && (!modMatrixGetParameterInfo(assignment->parameterIndex) ||
+        (trackType && !modMatrixParameterSupportsTrackType(*modMatrixGetParameterInfo(assignment->parameterIndex), *trackType))))
     {
         SendMessageW(state->parameterCombo, CB_SETCURSEL, 0, 0);
         int fallbackParameter = getComboSelectionData(state->parameterCombo);
@@ -621,6 +661,96 @@ void removeAssignment(ModMatrixWindowState* state, int assignmentId)
     }
 }
 
+int matrixPixels(const ModMatrixWindowState*, int value)
+{
+    HDC dc = GetDC(nullptr);
+    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
+    if (dc) ReleaseDC(nullptr, dc);
+    return MulDiv(value, dpi, 96);
+}
+
+void layoutMatrix(HWND hwnd, ModMatrixWindowState* state)
+{
+    if (!state) return;
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    auto px = [state](int value) { return matrixPixels(state, value); };
+    int padding = px(16);
+    int width = std::max(1, static_cast<int>(client.right) - padding * 2);
+    int listTop = px(58);
+    int listHeight = std::max(px(100), static_cast<int>(client.bottom) - listTop - px(240));
+    auto move = [](HWND control, int x, int y, int w, int h) {
+        if (control) MoveWindow(control, x, y, std::max(1, w), std::max(1, h), TRUE);
+    };
+    move(state->addButton, padding, padding, px(140), px(30));
+    move(state->removeButton, padding + px(148), padding, px(100), px(30));
+    move(state->lfoButton, client.right - padding - px(132), padding, px(132), px(30));
+    move(state->listView, padding, listTop, width, listHeight);
+    int available = std::max(1, width - GetSystemMetrics(SM_CXVSCROLL) - px(4));
+    int columns[] = {available * 20 / 100, available * 25 / 100, available * 30 / 100, 0};
+    columns[3] = available - columns[0] - columns[1] - columns[2];
+    for (int i = 0; i < 4; ++i) ListView_SetColumnWidth(state->listView, i, columns[i]);
+    int y = listTop + listHeight + px(12);
+    int half = (width - px(16)) / 2;
+    int right = padding + half + px(16);
+    move(state->editorLabel, padding, y, width, px(20));
+    move(state->sourceLabel, padding, y + px(28), half, px(18));
+    move(state->trackLabel, right, y + px(28), half, px(18));
+    move(state->sourceCombo, padding, y + px(48), half, px(kComboDropdownHeight));
+    move(state->trackCombo, right, y + px(48), half, px(kComboDropdownHeight));
+    move(state->parameterLabel, padding, y + px(84), width, px(18));
+    move(state->parameterCombo, padding, y + px(104), width, px(kComboDropdownHeight));
+    move(state->amountLabel, padding, y + px(140), width, px(20));
+    int sliderWidth = width - px(190);
+    move(state->amountSlider, padding, y + px(164), sliderWidth, px(32));
+    move(state->amountEdit, padding + sliderWidth + px(8), y + px(164), px(110), px(28));
+    move(state->resetAmountButton, client.right - padding - px(64), y + px(164), px(64), px(28));
+    move(state->hintLabel, padding, y + px(200), width, px(20));
+}
+
+bool createMatrixControls(HWND hwnd, ModMatrixWindowState* state)
+{
+    bool success = true;
+    auto create = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id = 0, DWORD extended = 0) {
+        HWND control = CreateWindowExW(extended, cls, text, WS_CHILD | WS_VISIBLE | style,
+            0, 0, 0, 0, hwnd, makeControlId(id), GetModuleHandle(nullptr), nullptr);
+        if (!control) success = false;
+        SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), FALSE);
+        return control;
+    };
+    state->addButton = create(L"BUTTON", L"+ Add assignment", WS_TABSTOP | BS_PUSHBUTTON, kAddButtonId);
+    state->removeButton = create(L"BUTTON", L"Remove", WS_TABSTOP | BS_PUSHBUTTON, kRemoveButtonId);
+    state->lfoButton = create(L"BUTTON", L"Edit LFOs...", WS_TABSTOP | BS_PUSHBUTTON, kLfoButtonId);
+    state->listView = create(WC_LISTVIEWW, L"", WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        kListViewId, WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(state->listView, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    const wchar_t* columns[] = {L"Source", L"Track", L"Parameter", L"Amount"};
+    for (int i = 0; i < 4; ++i) {
+        LVCOLUMNW column{};
+        column.mask = LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM;
+        column.iSubItem = i;
+        column.cx = 120;
+        column.pszText = const_cast<wchar_t*>(columns[i]);
+        ListView_InsertColumn(state->listView, i, &column);
+    }
+    state->editorLabel = create(L"STATIC", L"Selected assignment", SS_LEFT);
+    state->sourceLabel = create(L"STATIC", L"Source", SS_LEFT);
+    state->sourceCombo = create(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, kSourceComboId);
+    state->trackLabel = create(L"STATIC", L"Target track", SS_LEFT);
+    state->trackCombo = create(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, kTrackComboId);
+    state->parameterLabel = create(L"STATIC", L"Parameter", SS_LEFT);
+    state->parameterCombo = create(WC_COMBOBOXW, L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, kParameterComboId);
+    state->amountLabel = create(L"STATIC", L"Mod Amount:", SS_LEFT, kAmountLabelId);
+    state->amountSlider = create(TRACKBAR_CLASSW, L"", WS_TABSTOP | TBS_AUTOTICKS, kAmountSliderId);
+    SendMessageW(state->amountSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, kSliderResolution));
+    SendMessageW(state->amountSlider, TBM_SETTICFREQ, kSliderResolution / 2, 0);
+    state->amountEdit = create(L"EDIT", L"", WS_TABSTOP | ES_LEFT | ES_AUTOHSCROLL, kAmountEditId, WS_EX_CLIENTEDGE);
+    SendMessageW(state->amountEdit, EM_SETLIMITTEXT, 32, 0);
+    state->resetAmountButton = create(L"BUTTON", L"Reset", WS_TABSTOP | BS_PUSHBUTTON, kResetAmountId);
+    state->hintLabel = create(L"STATIC", L"Amount: value or signed percent. Enter applies; Esc cancels.", SS_LEFT);
+    return success;
+}
+
 void ensureModMatrixWindowClass()
 {
     if (gModMatrixWindowClassRegistered)
@@ -639,187 +769,17 @@ void ensureModMatrixWindowClass()
         {
         case WM_CREATE:
         {
-            auto createStruct = reinterpret_cast<LPCREATESTRUCTW>(lParam);
             auto* newState = new ModMatrixWindowState();
+            newState->embedded=(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_CHILD)!=0;
+            newState->boundTrack=getActiveSequencerTrackId();
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(newState));
-
-            newState->listView = CreateWindowExW(WS_EX_CLIENTEDGE,
-                                                WC_LISTVIEWW,
-                                                L"",
-                                                WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL,
-                                                0,
-                                                0,
-                                                0,
-                                                0,
-                                                hwnd,
-                                                makeControlId(kListViewId),
-                                                createStruct->hInstance,
-                                                nullptr);
-            if (newState->listView)
-            {
-                ListView_SetExtendedListViewStyle(newState->listView, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-
-                LVCOLUMNW column{};
-                column.mask = LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM;
-
-                column.cx = 120;
-                column.pszText = const_cast<wchar_t*>(L"Source");
-                ListView_InsertColumn(newState->listView, 0, &column);
-
-                column.cx = 150;
-                column.pszText = const_cast<wchar_t*>(L"Target");
-                ListView_InsertColumn(newState->listView, 1, &column);
-
-                column.cx = 140;
-                column.pszText = const_cast<wchar_t*>(L"Parameter");
-                ListView_InsertColumn(newState->listView, 2, &column);
-
-                column.cx = 120;
-                column.pszText = const_cast<wchar_t*>(L"Amount");
-                ListView_InsertColumn(newState->listView, 3, &column);
-            }
-
-            newState->addButton = CreateWindowExW(0,
-                                                  L"BUTTON",
-                                                  L"Add Assignment",
-                                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  hwnd,
-                                                  makeControlId(kAddButtonId),
-                                                  createStruct->hInstance,
-                                                  nullptr);
-
-            newState->removeButton = CreateWindowExW(0,
-                                                     L"BUTTON",
-                                                     L"Remove Assignment",
-                                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                                     0,
-                                                     0,
-                                                     0,
-                                                     0,
-                                                     hwnd,
-                                                     makeControlId(kRemoveButtonId),
-                                                     createStruct->hInstance,
-                                                     nullptr);
-
-            newState->lfoButton = CreateWindowExW(0,
-                                                  L"BUTTON",
-                                                  L"Edit LFOs...",
-                                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  0,
-                                                  hwnd,
-                                                  makeControlId(kLfoButtonId),
-                                                  createStruct->hInstance,
-                                                  nullptr);
-
-            newState->sourceCombo = CreateWindowExW(0,
-                                                    WC_COMBOBOXW,
-                                                    L"",
-                                                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                                    0,
-                                                    0,
-                                                    0,
-                                                    kComboDropdownHeight,
-                                                    hwnd,
-                                                    makeControlId(kSourceComboId),
-                                                    createStruct->hInstance,
-                                                    nullptr);
-
-            newState->parameterCombo = CreateWindowExW(0,
-                                                       WC_COMBOBOXW,
-                                                       L"",
-                                                       WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                                       0,
-                                                       0,
-                                                       0,
-                                                       kComboDropdownHeight,
-                                                       hwnd,
-                                                       makeControlId(kParameterComboId),
-                                                       createStruct->hInstance,
-                                                       nullptr);
-
-            newState->amountLabel = CreateWindowExW(0,
-                                                    L"STATIC",
-                                                    L"Mod Amount:",
-                                                    WS_CHILD | WS_VISIBLE | SS_LEFT,
-                                                    0,
-                                                    0,
-                                                    0,
-                                                    0,
-                                                    hwnd,
-                                                    makeControlId(kAmountLabelId),
-                                                    createStruct->hInstance,
-                                                    nullptr);
-
-            newState->amountSlider = CreateWindowExW(0,
-                                                     TRACKBAR_CLASSW,
-                                                     L"",
-                                                     WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS,
-                                                     0,
-                                                     0,
-                                                     0,
-                                                     0,
-                                                     hwnd,
-                                                     makeControlId(kAmountSliderId),
-                                                     createStruct->hInstance,
-                                                     nullptr);
-            if (newState->amountSlider)
-            {
-                SendMessageW(newState->amountSlider, TBM_SETRANGE, TRUE, MAKELPARAM(0, kSliderResolution));
-                SendMessageW(newState->amountSlider, TBM_SETTICFREQ, 100, 0);
-            }
-
-            newState->amountEdit = CreateWindowExW(0,
-                                                   L"EDIT",
-                                                   L"",
-                                                   WS_CHILD | WS_VISIBLE | WS_BORDER | ES_LEFT | ES_AUTOHSCROLL,
-                                                   0,
-                                                   0,
-                                                   0,
-                                                   0,
-                                                   hwnd,
-                                                   makeControlId(kAmountEditId),
-                                                   createStruct->hInstance,
-                                                   nullptr);
-            if (newState->amountEdit)
-                SendMessageW(newState->amountEdit, EM_SETLIMITTEXT, 32, 0);
-
-            auto configureComboDropdown = [](HWND combo) {
-                if (!combo)
-                    return;
-#ifdef CB_SETMINVISIBLE
-                SendMessageW(combo, CB_SETMINVISIBLE, 8, 0);
-#endif
-            };
-
-            configureComboDropdown(newState->sourceCombo);
-            configureComboDropdown(newState->parameterCombo);
-
+            if (!createMatrixControls(hwnd, newState)) return -1;
             populateSourceCombo(newState->sourceCombo);
-            populateParameterCombo(newState->parameterCombo);
-
-            auto existingAssignments = modMatrixGetAssignments();
-            if (existingAssignments.empty())
-            {
-                addAssignment(newState);
-            }
-            else
-            {
-                newState->selectedAssignmentId = existingAssignments.front().id;
-            }
-
+            auto assignments = modMatrixGetAssignments();
+            if (!assignments.empty()) newState->selectedAssignmentId = assignments.front().id;
             repopulateAssignmentList(newState);
             loadAssignmentIntoControls(newState, newState->selectedAssignmentId);
-
-            RECT rect{};
-            GetClientRect(hwnd, &rect);
-            SendMessageW(hwnd, WM_SIZE, 0, MAKELPARAM(rect.right - rect.left, rect.bottom - rect.top));
+            layoutMatrix(hwnd, newState);
             return 0;
         }
         case WM_DESTROY:
@@ -836,65 +796,16 @@ void ensureModMatrixWindowClass()
             }
             return 0;
         }
-        case WM_SIZE:
+        case WM_GETMINMAXINFO:
         {
-            if (!state)
-                return 0;
-
-            int width = LOWORD(lParam);
-            int height = HIWORD(lParam);
-            const int padding = 12;
-            const int buttonHeight = 28;
-            const int buttonSpacing = 8;
-            const int comboHeight = 28;
-            const int labelHeight = 20;
-            const int sliderHeight = 32;
-            const int editHeight = 28;
-
-            int listViewHeight = std::max(140, height / 2);
-
-            if (state->listView)
-                MoveWindow(state->listView, padding, padding, std::max(0, width - padding * 2), listViewHeight, TRUE);
-
-            int buttonY = padding + listViewHeight + buttonSpacing;
-            int buttonWidth = 140;
-
-            if (state->addButton)
-                MoveWindow(state->addButton, padding, buttonY, buttonWidth, buttonHeight, TRUE);
-            if (state->removeButton)
-                MoveWindow(state->removeButton, padding + buttonWidth + buttonSpacing, buttonY, buttonWidth, buttonHeight, TRUE);
-            if (state->lfoButton)
-                MoveWindow(state->lfoButton,
-                           padding + (buttonWidth + buttonSpacing) * 2,
-                           buttonY,
-                           buttonWidth,
-                           buttonHeight,
-                           TRUE);
-
-            int formY = buttonY + buttonHeight + buttonSpacing;
-
-            int controlWidth = std::max(0, width - padding * 2);
-            if (state->sourceCombo)
-                MoveWindow(state->sourceCombo, padding, formY, controlWidth, kComboDropdownHeight, TRUE);
-            formY += comboHeight + buttonSpacing;
-
-            if (state->parameterCombo)
-                MoveWindow(state->parameterCombo, padding, formY, controlWidth, kComboDropdownHeight, TRUE);
-            formY += comboHeight + buttonSpacing;
-
-            if (state->amountLabel)
-                MoveWindow(state->amountLabel, padding, formY, controlWidth, labelHeight, TRUE);
-            formY += labelHeight + buttonSpacing;
-
-            if (state->amountEdit)
-                MoveWindow(state->amountEdit, padding, formY, controlWidth, editHeight, TRUE);
-            formY += editHeight + buttonSpacing;
-
-            if (state->amountSlider)
-                MoveWindow(state->amountSlider, padding, formY, controlWidth, sliderHeight, TRUE);
-
+            auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+            info->ptMinTrackSize.x = matrixPixels(state, 640);
+            info->ptMinTrackSize.y = matrixPixels(state, 540);
             return 0;
         }
+        case WM_SIZE:
+            layoutMatrix(hwnd, state);
+            return 0;
         case WM_COMMAND:
         {
             if (!state)
@@ -924,7 +835,7 @@ void ensureModMatrixWindowClass()
 
                 if (targetTrackId <= 0)
                 {
-                    targetTrackId = getActiveSequencerTrackId();
+                    targetTrackId = state->embedded ? state->boundTrack : getActiveSequencerTrackId();
                     if (targetTrackId <= 0)
                     {
                         auto tracks = getTracks();
@@ -935,6 +846,32 @@ void ensureModMatrixWindowClass()
 
                 if (targetTrackId > 0)
                     openLfoWindow(hwnd, targetTrackId);
+                return 0;
+            }
+            case kTrackComboId:
+                if (code == CBN_SELCHANGE)
+                {
+                    int trackId = getComboSelectionData(state->trackCombo);
+                    auto assignment = modMatrixGetAssignment(state->selectedAssignmentId);
+                    if (assignment && trackExists(trackId))
+                    {
+                        assignment->trackId = trackId;
+                        modMatrixUpdateAssignment(*assignment);
+                        loadAssignmentIntoControls(state, assignment->id);
+                        repopulateAssignmentList(state);
+                    }
+                }
+                return 0;
+            case kResetAmountId:
+            {
+                auto assignment = modMatrixGetAssignment(state->selectedAssignmentId);
+                if (assignment)
+                {
+                    assignment->normalizedAmount = 0.0f;
+                    modMatrixUpdateAssignment(*assignment);
+                    loadAssignmentIntoControls(state, assignment->id);
+                    repopulateAssignmentList(state);
+                }
                 return 0;
             }
             case kSourceComboId:
@@ -951,6 +888,15 @@ void ensureModMatrixWindowClass()
                 }
                 return 0;
             case kParameterComboId:
+                if (code == CBN_DROPDOWN)
+                {
+                    auto assignment = modMatrixGetAssignment(state->selectedAssignmentId);
+                    if (assignment)
+                    {
+                        populateParameterCombo(state->parameterCombo, getTrackTypeForTrack(assignment->trackId), assignment->trackId);
+                        setComboSelectionByData(state->parameterCombo, assignment->parameterIndex);
+                    }
+                }
                 if (code == CBN_SELCHANGE)
                 {
                     int data = getComboSelectionData(state->parameterCombo);
@@ -984,7 +930,7 @@ void ensureModMatrixWindowClass()
                 return 0;
 
             auto* header = reinterpret_cast<LPNMHDR>(lParam);
-            if (header->hwndFrom == state->listView && header->code == LVN_ITEMCHANGED)
+            if (!state->rebuildingList && header->hwndFrom == state->listView && header->code == LVN_ITEMCHANGED)
             {
                 auto* changed = reinterpret_cast<LPNMLISTVIEW>(lParam);
                 if ((changed->uChanged & LVIF_STATE) != 0)
@@ -1054,19 +1000,8 @@ void ensureModMatrixWindowClass()
             if (!state)
                 return 0;
 
-            int trackId = static_cast<int>(wParam);
-            auto assignments = modMatrixGetAssignments();
-            for (auto& assignment : assignments)
-            {
-                if (trackId == 0 || assignment.trackId == trackId)
-                {
-                    syncAssignmentFromTrack(assignment);
-                    modMatrixUpdateAssignment(assignment);
-                }
-            }
-
             auto selected = modMatrixGetAssignment(state->selectedAssignmentId);
-            if (selected)
+            if (selected && GetFocus() != state->amountEdit)
             {
                 setSliderFromAssignment(state->amountSlider, *selected);
                 updateAmountLabel(state->amountLabel, *selected);
@@ -1096,8 +1031,34 @@ void ensureModMatrixWindowClass()
 
 } // namespace
 
+bool handleModMatrixKeyboard(MSG* message)
+{
+    if (!message || !gModMatrixWindow || !IsWindow(gModMatrixWindow) ||
+        (message->hwnd != gModMatrixWindow && !IsChild(gModMatrixWindow, message->hwnd)))
+        return false;
+    auto* state = getWindowState(gModMatrixWindow);
+    if (state && message->hwnd == state->amountEdit && message->message == WM_KEYDOWN)
+    {
+        if (message->wParam == VK_ESCAPE)
+        {
+            auto assignment = modMatrixGetAssignment(state->selectedAssignmentId);
+            if (assignment) setEditFromAssignment(state->amountEdit, *assignment);
+            SetFocus(state->listView);
+            return true;
+        }
+        if (message->wParam == VK_RETURN)
+        {
+            SetFocus(state->listView);
+            return true;
+        }
+    }
+    return IsDialogMessageW(gModMatrixWindow, message) != FALSE;
+}
+
 bool isModMatrixWindowOpen()
 {
+    if(editingPanelCreated())return isEditingPanelVisible(EditingPage::Mod);
+    if(gModMatrixWindow && (GetWindowLongPtrW(gModMatrixWindow,GWL_STYLE)&WS_CHILD))return isEditingPanelVisible(EditingPage::Mod);
     return gModMatrixWindow && IsWindow(gModMatrixWindow);
 }
 
@@ -1112,6 +1073,10 @@ void closeModMatrixWindow()
 
 void openModMatrixWindow(HWND parent)
 {
+    if(editingPanelCreated()){revealEditingPanel(EditingPage::Mod);return;}
+    if(gModMatrixWindow && (GetWindowLongPtrW(gModMatrixWindow,GWL_STYLE)&WS_CHILD)) {
+        revealEditingPanel(EditingPage::Mod);return;
+    }
     if (gModMatrixWindow && IsWindow(gModMatrixWindow))
     {
         SetForegroundWindow(gModMatrixWindow);
@@ -1134,10 +1099,10 @@ void openModMatrixWindow(HWND parent)
         y = parentRect.top + 80;
     }
 
-    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW,
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
                                 kModMatrixWindowClassName,
                                 L"Modulation Matrix",
-                                WS_OVERLAPPEDWINDOW,
+                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 x,
                                 y,
                                 kModMatrixWindowWidth,
@@ -1157,6 +1122,10 @@ void openModMatrixWindow(HWND parent)
 
 void toggleModMatrixWindow(HWND parent)
 {
+    if(editingPanelCreated()){revealEditingPanel(EditingPage::Mod);return;}
+    if(gModMatrixWindow && (GetWindowLongPtrW(gModMatrixWindow,GWL_STYLE)&WS_CHILD)) {
+        revealEditingPanel(EditingPage::Mod);return;
+    }
     if (gModMatrixWindow && IsWindow(gModMatrixWindow))
     {
         closeModMatrixWindow();
@@ -1185,6 +1154,8 @@ void notifyModMatrixWindowValuesChanged(int trackId)
 
 void focusModMatrixTarget(ModMatrixParameter parameter, int trackId)
 {
+    if(editingPanelCreated()){focusEditingModTarget(modMatrixGetParameterIndex(parameter),trackId);return;}
+    revealEditingPanel(EditingPage::Mod,trackId);
     if (trackId <= 0)
         return;
 
@@ -1241,6 +1212,25 @@ void focusModMatrixTarget(ModMatrixParameter parameter, int trackId)
         }
     }
 
-    SetForegroundWindow(gModMatrixWindow);
+    SetFocus(state->listView);
 }
 
+HWND createModMatrixView(HWND parent)
+{
+    ensureModMatrixWindowClass();
+    gModMatrixWindow=CreateWindowExW(WS_EX_CONTROLPARENT,kModMatrixWindowClassName,L"Mod Matrix",
+        WS_CHILD|WS_VISIBLE|WS_CLIPCHILDREN,0,0,420,440,parent,nullptr,GetModuleHandle(nullptr),nullptr);
+    auto* state=getWindowState(gModMatrixWindow);
+    if(state)state->embedded=true;
+    bindModMatrixView(getActiveSequencerTrackId());
+    return gModMatrixWindow;
+}
+void bindModMatrixView(int trackId)
+{
+    auto* state=gModMatrixWindow?getWindowState(gModMatrixWindow):nullptr;
+    if(!state)return;
+    if(GetFocus()==state->amountEdit){updateAssignmentAmountFromEdit(state);SetFocus(state->listView);}
+    state->boundTrack=trackId;state->selectedAssignmentId=0;
+    repopulateAssignmentList(state);loadAssignmentIntoControls(state,state->selectedAssignmentId);
+    EnableWindow(state->lfoButton,trackId>0);
+}

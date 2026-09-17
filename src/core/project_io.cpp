@@ -1,6 +1,12 @@
 #include "core/project_io.h"
+#ifdef KJ_ENABLE_VST3
+#include "hosting/TrackVST3.h"
+#include "core/audio_engine.h"
+#include "core/audio_recording.h"
+#endif
 
 #include "core/mod_matrix.h"
+#include "core/piano_pattern.h"
 #include "core/mod_matrix_parameters.h"
 #include "core/sequencer.h"
 #include "core/tracks.h"
@@ -101,12 +107,16 @@ std::string trackTypeToString(TrackType type)
 {
     switch (type)
     {
+    case TrackType::AudioIn:
+        return "Audio In";
     case TrackType::Sample:
         return "Sample";
     case TrackType::MidiOut:
         return "MIDI Out";
     case TrackType::Synth:
         return "Synth";
+    case TrackType::Vst3:
+        return "VST3";
     }
     return "Synth";
 }
@@ -136,8 +146,11 @@ std::string formatFloat(float value)
 
 TrackType trackTypeFromString(const std::string& value)
 {
+    if(value=="Audio In")return TrackType::AudioIn;
     if (value == "Synth")
         return TrackType::Synth;
+    if (value == "VST3")
+        return TrackType::Vst3;
     if (value == "Sample")
         return TrackType::Sample;
     if (value == "MIDI Out" || value == "MidiOut" || value == "MIDI")
@@ -633,6 +646,100 @@ std::string jsonToString(const JsonValue* value)
     return {};
 }
 
+// Binary plugin streams are hex encoded so unknown/missing plugins round-trip
+// unchanged even in builds without the VST3 host.
+std::string encodeState(const std::string& bytes) {
+    const char* digits = "0123456789abcdef";
+    std::string text; text.reserve(bytes.size() * 2);
+    for (unsigned char c : bytes) { text += digits[c >> 4]; text += digits[c & 15]; }
+    return text;
+}
+bool decodeState(const std::string& text, std::string& bytes) {
+    if (text.size() % 2 || text.size() > 128u * 1024u * 1024u) return false;
+    auto digit = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1; };
+    bytes.clear(); bytes.reserve(text.size() / 2);
+    for (size_t i = 0; i < text.size(); i += 2) {
+        int a = digit(text[i]), b = digit(text[i + 1]); if (a < 0 || b < 0) return false;
+        bytes += static_cast<char>((a << 4) | b);
+    }
+    return true;
+}
+void writeRack(std::ostream& out, const kj::Vst3RackState& rack) {
+    out << "      \"vst3\": [";
+    for (size_t i = 0; i < rack.size(); ++i) {
+        const auto& s = rack[i]; if (i) out << ',';
+        out << "\n        {\"id\":\"" << escapeJsonString(s.id)
+            << "\",\"name\":\"" << escapeJsonString(s.name)
+            << "\",\"path\":\"" << escapeJsonString(s.path)
+            << "\",\"classId\":\"" << escapeJsonString(s.classId)
+            << "\",\"instrument\":" << (s.instrument ? "true" : "false")
+            << ",\"bypass\":" << (s.bypass ? "true" : "false")
+            << ",\"hasComponent\":" << (s.state.hasComponent ? "true" : "false")
+            << ",\"hasController\":" << (s.state.hasController ? "true" : "false")
+            << ",\"component\":\"" << encodeState(s.state.component)
+            << "\",\"controller\":\"" << encodeState(s.state.controller) << "\",\"parameters\":[";
+        for (size_t p = 0; p < s.state.parameters.size(); ++p) {
+            if (p) out << ',';
+            out << '[' << s.state.parameters[p].first << ',' << std::setprecision(17) << s.state.parameters[p].second << ']';
+        }
+        out << "],\"learnedParameters\":[";
+        for (size_t p = 0; p < s.learnedParameters.size(); ++p) {
+            if (p) out << ',';
+            out << "{\"id\":" << s.learnedParameters[p].id << ",\"name\":\"" << escapeJsonString(s.learnedParameters[p].name) << "\"}";
+        }
+        out << "]}";
+    }
+    out << "],\n";
+}
+bool readRack(const JsonValue* value, kj::Vst3RackState& rack) {
+    if (!value) return true;
+    if (!value->isArray() || value->asArray().size() > 256) return false;
+    bool hasInstrument = false;
+    for (const auto& item : value->asArray()) {
+        if (!item.isObject()) return false;
+        const auto& o = item.asObject(); kj::Vst3SlotState s;
+        s.id = jsonToString(findMember(o, "id")); s.name = jsonToString(findMember(o, "name"));
+        s.path = jsonToString(findMember(o, "path")); s.classId = jsonToString(findMember(o, "classId"));
+        s.instrument = jsonToBool(findMember(o, "instrument"), false); s.bypass = jsonToBool(findMember(o, "bypass"), false);
+        if (s.instrument && hasInstrument) return false; hasInstrument |= s.instrument;
+        s.state.hasComponent = jsonToBool(findMember(o, "hasComponent"), false);
+        s.state.hasController = jsonToBool(findMember(o, "hasController"), false);
+        if (!decodeState(jsonToString(findMember(o, "component")), s.state.component) ||
+            !decodeState(jsonToString(findMember(o, "controller")), s.state.controller)) return false;
+        if (const auto* params = findMember(o, "parameters")) {
+            if (!params->isArray() || params->asArray().size() > 100000) return false;
+            for (const auto& p : params->asArray()) {
+                if (!p.isArray() || p.asArray().size() != 2) return false;
+                const auto& a = p.asArray(); if (!a[0].isNumber() || !a[1].isNumber()) return false;
+                double id = a[0].asNumber(), v = a[1].asNumber();
+                if (!std::isfinite(id) || id < 0 || id > 4294967295. || std::floor(id) != id || !std::isfinite(v) || v < 0 || v > 1) return false;
+                s.state.parameters.emplace_back(static_cast<std::uint32_t>(id), v);
+            }
+        }
+        if (const auto* targets = findMember(o, "learnedParameters")) {
+            if (!targets->isArray() || targets->asArray().size() > 100000) return false;
+            for (const auto& target : targets->asArray()) {
+                if (!target.isObject()) return false;
+                const auto* param = findMember(target.asObject(), "id");
+                if (!param || !param->isNumber()) return false;
+                double id = param->asNumber();
+                if (!std::isfinite(id) || id < 0 || id > 4294967295. || std::floor(id) != id) return false;
+                auto key = static_cast<std::uint32_t>(id);
+                if (std::none_of(s.learnedParameters.begin(), s.learnedParameters.end(), [key](const kj::Vst3ParameterTarget& p){return p.id == key;}))
+                    s.learnedParameters.push_back({key, jsonToString(findMember(target.asObject(), "name"))});
+            }
+        }
+        rack.push_back(std::move(s));
+    }
+    return true;
+}
+#ifdef KJ_ENABLE_VST3
+struct ProjectAudioPause {
+    bool restart = isAudioRunning();
+    ProjectAudioPause() { if (restart) shutdownAudio(); }
+    ~ProjectAudioPause() { if (restart) initAudio(false); }
+};
+#endif
 } // namespace
 
 bool saveProjectToFile(const std::filesystem::path& path)
@@ -648,6 +755,15 @@ bool saveProjectToFile(const std::filesystem::path& path)
         targetPath.replace_extension(".jik");
     }
 
+#ifdef KJ_ENABLE_VST3
+    if (isAudioRecording()) return false;
+    ProjectAudioPause pause;
+    try {
+        std::vector<std::pair<int, kj::Vst3RackState>> states;
+        for (const auto& track : getTracks()) states.emplace_back(track.id, kj::captureTrackVst3(track.id));
+        for (auto& state : states) trackSetVst3State(state.first, std::move(state.second));
+    } catch (...) { return false; }
+#endif
     std::ofstream stream(targetPath, std::ios::binary | std::ios::trunc);
     if (!stream)
     {
@@ -705,8 +821,21 @@ bool saveProjectToFile(const std::filesystem::path& path)
 
         stream << "    {\n";
         stream << "      \"id\": " << track.id << ",\n";
+        writeRack(stream, trackGetVst3State(track.id));
+        stream << "      \"fxOrder\": [";
+        auto order = track.fxOrder;
+        for (const auto& slot : trackGetVst3State(track.id)) if (!slot.instrument && std::find(order.begin(), order.end(), slot.id) == order.end()) order.push_back(slot.id);
+        for (size_t j = 0; j < order.size(); ++j) { if (j) stream << ','; stream << '"' << escapeJsonString(order[j]) << '"'; }
+        stream << "],\n";
         stream << "      \"name\": \"" << escapeJsonString(track.name) << "\",\n";
+        stream << "      \"pianoRoll\": \"" << escapeJsonString(piano::serialize(track.id)) << "\",\n";
         stream << "      \"type\": \"" << trackTypeToString(type) << "\",\n";
+        stream << "      \"mute\": " << (track.mute ? "true" : "false") << ",\n";
+        stream << "      \"solo\": " << (track.solo ? "true" : "false") << ",\n";
+        stream << "      \"inputDeviceId\": \"" << escapeJsonString(track.inputDeviceId) << "\",\n";
+        stream << "      \"inputDeviceName\": \"" << escapeJsonString(track.inputDeviceName) << "\",\n";
+        stream << "      \"inputChannel\": " << track.inputChannel << ",\n";
+        stream << "      \"inputStereo\": " << (track.inputStereo ? "true" : "false") << ",\n";
         stream << "      \"waveType\": \"" << synthWaveTypeToString(waveType) << "\",\n";
         stream << "      \"volume\": " << formatFloat(volume) << ",\n";
         stream << "      \"pan\": " << formatFloat(pan) << ",\n";
@@ -714,6 +843,11 @@ bool saveProjectToFile(const std::filesystem::path& path)
         stream << "      \"eqMid\": " << formatFloat(midGain) << ",\n";
         stream << "      \"eqHigh\": " << formatFloat(highGain) << ",\n";
         stream << "      \"eqEnabled\": " << (eqEnabled ? "true" : "false") << ",\n";
+        for (int band = 0; band < 3; ++band) {
+            stream << "      \"eqFrequency" << band << "\": " << formatFloat(trackGetEqFrequency(track.id, band)) << ",\n";
+            stream << "      \"eqQ" << band << "\": " << formatFloat(trackGetEqQ(track.id, band)) << ",\n";
+            stream << "      \"eqShape" << band << "\": " << trackGetEqShape(track.id, band) << ",\n";
+        }
         stream << "      \"delayEnabled\": " << (delayEnabled ? "true" : "false") << ",\n";
         stream << "      \"delayTimeMs\": " << formatFloat(delayTimeMs) << ",\n";
         stream << "      \"delayFeedback\": " << formatFloat(delayFeedback) << ",\n";
@@ -739,6 +873,8 @@ bool saveProjectToFile(const std::filesystem::path& path)
         {
             stream << "        {\n";
             stream << "          \"index\": " << oscIndex << ",\n";
+            stream << "          \"wavetablePosition\": " << formatFloat(trackGetSynthOscWavetablePosition(track.id, static_cast<int>(oscIndex))) << ",\n";
+            stream << "          \"wavetableMix\": " << formatFloat(trackGetSynthOscWavetableMix(track.id, static_cast<int>(oscIndex))) << ",\n";
             stream << "          \"wavetable\": " << (trackGetSynthOscWavetableEnabled(track.id, static_cast<int>(oscIndex)) ? "true" : "false") << ",\n";
             stream << "          \"formant\": "
                    << formatFloat(trackGetSynthOscFormant(track.id, static_cast<int>(oscIndex))) << ",\n";
@@ -761,6 +897,18 @@ bool saveProjectToFile(const std::filesystem::path& path)
             stream << "        }" << (oscIndex + 1 < kSynthOscillatorCount ? ",\n" : "\n");
         }
         stream << "      ],\n";
+        stream << "      \"selectedDrum\": " << trackGetSelectedDrum(track.id) << ",\n";
+        stream << "      \"drums\": [";
+        bool firstDrum=true;
+        for(const auto& entry:track.drums){
+            if(!firstDrum)stream << ",";firstDrum=false;
+            const auto& d=entry.second;
+            stream << "{\"lane\":" << entry.first << ",\"attack\":" << formatFloat(d.attack)
+                   << ",\"release\":" << formatFloat(d.release) << ",\"pitch\":" << formatFloat(d.pitch)
+                   << ",\"pan\":" << formatFloat(d.pan) << ",\"volume\":" << formatFloat(d.volume) << "}";
+        }
+        stream << "],\n";
+        stream << "      \"sampleDrumMode\": " << (trackGetSampleDrumMode(track.id) ? "true" : "false") << ",\n";
         stream << "      \"sampleAttack\": " << formatFloat(sampleAttack) << ",\n";
         stream << "      \"sampleRelease\": " << formatFloat(sampleRelease) << ",\n";
         stream << "      \"lfos\": [\n";
@@ -865,6 +1013,11 @@ bool saveProjectToFile(const std::filesystem::path& path)
         stream << "      \"source\": " << assignment.sourceIndex << ",\n";
         stream << "      \"trackId\": " << assignment.trackId << ",\n";
         stream << "      \"parameter\": " << assignment.parameterIndex << ",\n";
+        if (!assignment.vstSlotId.empty()) {
+            stream << "      \"vstSlotId\": \"" << escapeJsonString(assignment.vstSlotId) << "\",\n";
+            stream << "      \"vstParameterId\": " << assignment.vstParameterId << ",\n";
+            stream << "      \"vstParameterName\": \"" << escapeJsonString(assignment.vstParameterName) << "\",\n";
+        }
         stream << "      \"amount\": " << formatFloat(assignment.normalizedAmount) << "\n";
         stream << "    }";
         if (i + 1 < assignments.size())
@@ -915,6 +1068,29 @@ bool loadProjectFromFile(const std::filesystem::path& path)
 
     const auto& tracksArray = tracksValue->asArray();
 
+    std::vector<kj::Vst3RackState> racks(tracksArray.size());
+    std::vector<std::vector<std::string>> orders(tracksArray.size());
+    for (size_t i = 0; i < tracksArray.size(); ++i) {
+        if (!tracksArray[i].isObject() || !readRack(findMember(tracksArray[i].asObject(), "vst3"), racks[i])) return false;
+        if (const auto* value = findMember(tracksArray[i].asObject(), "fxOrder")) {
+            if (!value->isArray() || value->asArray().size() > 260) return false;
+            for (const auto& key : value->asArray()) {
+                if (!key.isString() || key.asString().empty() || std::find(orders[i].begin(), orders[i].end(), key.asString()) != orders[i].end()) return false;
+                orders[i].push_back(key.asString());
+            }
+        } else {
+            // Projects made before mixed racks ran every plugin before native FX.
+            for (const auto& slot : racks[i]) if (!slot.instrument) orders[i].push_back(slot.id);
+            orders[i].insert(orders[i].end(), {"kj:eq", "kj:compressor", "kj:delay", "kj:sidechain"});
+        }
+        for (const auto& slot : racks[i]) if (!slot.instrument && std::find(orders[i].begin(), orders[i].end(), slot.id) == orders[i].end()) orders[i].push_back(slot.id);
+    }
+#ifdef KJ_ENABLE_VST3
+    if (isAudioRecording()) return false;
+    ProjectAudioPause pause;
+    kj::clearTrackVst3();
+#endif
+
     initTracks();
     modMatrixClearAssignments();
 
@@ -945,16 +1121,32 @@ bool loadProjectFromFile(const std::filesystem::path& path)
 
         int trackId = trackIds[i];
         const auto& trackObject = trackValue.asObject();
+        trackSetVst3State(trackId, racks[i]);
+        trackSetFxOrder(trackId, orders[i]);
+#ifdef KJ_ENABLE_VST3
+        kj::restoreTrackVst3(trackId, racks[i], getAudioSampleRate());
+#endif
 
         trackSetName(trackId, jsonToString(findMember(trackObject, "name")));
+        piano::deserialize(trackId, jsonToString(findMember(trackObject, "pianoRoll")));
         trackSetType(trackId, trackTypeFromString(jsonToString(findMember(trackObject, "type"))));
+        trackSetMute(trackId,jsonToBool(findMember(trackObject,"mute"),false));
+        trackSetSolo(trackId,jsonToBool(findMember(trackObject,"solo"),false));
+        trackSetInputDevice(trackId,jsonToString(findMember(trackObject,"inputDeviceId")),jsonToString(findMember(trackObject,"inputDeviceName")));
+        trackSetInputChannels(trackId,jsonToInt(findMember(trackObject,"inputChannel"),0),jsonToBool(findMember(trackObject,"inputStereo"),false));
+        trackSetInputMonitor(trackId,false);
         trackSetSynthWaveType(trackId, synthWaveTypeFromString(jsonToString(findMember(trackObject, "waveType"))));
         trackSetVolume(trackId, jsonToFloat(findMember(trackObject, "volume"), trackGetVolume(trackId)));
         trackSetPan(trackId, jsonToFloat(findMember(trackObject, "pan"), trackGetPan(trackId)));
         trackSetEqLowGain(trackId, jsonToFloat(findMember(trackObject, "eqLow"), trackGetEqLowGain(trackId)));
         trackSetEqMidGain(trackId, jsonToFloat(findMember(trackObject, "eqMid"), trackGetEqMidGain(trackId)));
         trackSetEqHighGain(trackId, jsonToFloat(findMember(trackObject, "eqHigh"), trackGetEqHighGain(trackId)));
-        trackSetEqEnabled(trackId, jsonToBool(findMember(trackObject, "eqEnabled"), trackGetEqEnabled(trackId)));
+        trackSetEqEnabled(trackId, jsonToBool(findMember(trackObject, "eqEnabled"), findMember(trackObject, "fxOrder") == nullptr));
+        for (int band = 0; band < 3; ++band) {
+            trackSetEqFrequency(trackId, band, jsonToFloat(findMember(trackObject, "eqFrequency" + std::to_string(band)), trackGetEqFrequency(trackId, band)));
+            trackSetEqQ(trackId, band, jsonToFloat(findMember(trackObject, "eqQ" + std::to_string(band)), trackGetEqQ(trackId, band)));
+            trackSetEqShape(trackId, band, jsonToInt(findMember(trackObject, "eqShape" + std::to_string(band)), 0));
+        }
         trackSetSynthFormant(trackId, jsonToFloat(findMember(trackObject, "formant"), trackGetSynthFormant(trackId)));
         trackSetSynthResonance(trackId,
                                jsonToFloat(findMember(trackObject, "resonance"), trackGetSynthResonance(trackId)));
@@ -984,6 +1176,10 @@ bool loadProjectFromFile(const std::filesystem::path& path)
                 trackSetSynthOscWavetableEnabled(trackId, index,
                                                  jsonToBool(findMember(oscObject, "wavetable"),
                                                             trackGetSynthOscWavetableEnabled(trackId, index)));
+                trackSetSynthOscWavetablePosition(trackId, index,
+                    jsonToFloat(findMember(oscObject, "wavetablePosition"), 0.0f));
+                trackSetSynthOscWavetableMix(trackId, index,
+                    jsonToFloat(findMember(oscObject, "wavetableMix"), 1.0f));
                 trackSetSynthOscFormant(trackId, index,
                                         jsonToFloat(findMember(oscObject, "formant"), trackGetSynthOscFormant(trackId, index)));
                 trackSetSynthOscResonance(trackId, index,
@@ -1007,8 +1203,22 @@ bool loadProjectFromFile(const std::filesystem::path& path)
                                         jsonToFloat(findMember(oscObject, "release"), trackGetSynthOscRelease(trackId, index)));
             }
         }
+        trackSetSampleDrumMode(trackId, jsonToBool(findMember(trackObject, "sampleDrumMode"), false));
         trackSetSampleAttack(trackId, jsonToFloat(findMember(trackObject, "sampleAttack"), trackGetSampleAttack(trackId)));
         trackSetSampleRelease(trackId, jsonToFloat(findMember(trackObject, "sampleRelease"), trackGetSampleRelease(trackId)));
+        trackSetSelectedDrum(trackId,jsonToInt(findMember(trackObject,"selectedDrum"),0));
+        if(const auto* drums=findMember(trackObject,"drums");drums && drums->isArray()) {
+            for(const auto& entry:drums->asArray()) {
+                if(!entry.isObject())continue;
+                const auto& object=entry.asObject();int lane=jsonToInt(findMember(object,"lane"),-1);
+                if(lane<0||lane>65535)continue;
+                trackSetDrumParameter(trackId,lane,DrumParameter::Attack,jsonToFloat(findMember(object,"attack"),trackGetSampleAttack(trackId)));
+                trackSetDrumParameter(trackId,lane,DrumParameter::Release,jsonToFloat(findMember(object,"release"),trackGetSampleRelease(trackId)));
+                trackSetDrumParameter(trackId,lane,DrumParameter::Pitch,jsonToFloat(findMember(object,"pitch"),0));
+                trackSetDrumParameter(trackId,lane,DrumParameter::Pan,jsonToFloat(findMember(object,"pan"),0));
+                trackSetDrumParameter(trackId,lane,DrumParameter::Volume,jsonToFloat(findMember(object,"volume"),1));
+            }
+        }
         const JsonValue* lfosValue = findMember(trackObject, "lfos");
         if (lfosValue && lfosValue->isArray())
         {
@@ -1173,6 +1383,16 @@ bool loadProjectFromFile(const std::filesystem::path& path)
             assignment.sourceIndex = jsonToInt(findMember(entryObject, "source"), 0);
             assignment.trackId = jsonToInt(findMember(entryObject, "trackId"), 0);
             assignment.parameterIndex = jsonToInt(findMember(entryObject, "parameter"), 0);
+            assignment.vstSlotId = jsonToString(findMember(entryObject, "vstSlotId"));
+            assignment.vstParameterName = jsonToString(findMember(entryObject, "vstParameterName"));
+            if (!assignment.vstSlotId.empty()) {
+                const auto* param = findMember(entryObject, "vstParameterId");
+                if (!param || !param->isNumber()) continue;
+                double id = param->asNumber();
+                if (!std::isfinite(id) || id < 0 || id > 4294967295. || std::floor(id) != id) continue;
+                assignment.vstParameterId = static_cast<std::uint32_t>(id);
+                assignment.parameterIndex = -1;
+            }
             assignment.normalizedAmount = modMatrixClampNormalized(
                 jsonToFloat(findMember(entryObject, "amount"), assignment.normalizedAmount));
             assignments.push_back(assignment);

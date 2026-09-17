@@ -1,4 +1,5 @@
 #include "gui/lfo_window.h"
+#include "gui/editing_panel.h"
 
 #include "core/track_type_synth.h"
 #include "core/tracks.h"
@@ -16,11 +17,11 @@ namespace
 {
 
 constexpr wchar_t kLfoWindowClassName[] = L"KJLfoWindow";
-constexpr int kDefaultWindowWidth = 400;
+constexpr int kDefaultWindowWidth = 560;
 constexpr int kDefaultWindowHeight = 520;
 
-constexpr int kRateSliderMin = 5;    // 0.05 Hz
-constexpr int kRateSliderMax = 2000; // 20 Hz
+constexpr int kRateSliderMin = 0;
+constexpr int kRateSliderMax = 1000;
 constexpr int kDeformSliderMin = 0;
 constexpr int kDeformSliderMax = 100;
 constexpr float kUiMinLfoRateHz = 0.05f;
@@ -102,13 +103,15 @@ void applyFont(LfoWindowState* state, HFONT font)
 int rateToSlider(float rate)
 {
     float clamped = std::clamp(rate, kUiMinLfoRateHz, kUiMaxLfoRateHz);
-    return static_cast<int>(std::lround(clamped * 100.0f));
+    return static_cast<int>(std::lround(std::log(clamped / kUiMinLfoRateHz) /
+        std::log(kUiMaxLfoRateHz / kUiMinLfoRateHz) * kRateSliderMax));
 }
 
 float sliderToRate(int slider)
 {
     int clamped = std::clamp(slider, kRateSliderMin, kRateSliderMax);
-    return static_cast<float>(clamped) / 100.0f;
+    return kUiMinLfoRateHz * std::pow(kUiMaxLfoRateHz / kUiMinLfoRateHz,
+        static_cast<float>(clamped) / kRateSliderMax);
 }
 
 int deformToSlider(float deform)
@@ -123,68 +126,38 @@ float sliderToDeform(int slider)
     return static_cast<float>(clamped) / 100.0f;
 }
 
+int lfoPixels(HWND hwnd, int value)
+{
+    HDC dc = GetDC(hwnd);
+    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc) ReleaseDC(hwnd, dc);
+    return MulDiv(value, dpi, 96);
+}
+
 void layoutWindow(HWND hwnd, LfoWindowState* state, int width, int height)
 {
-    if (!state)
-        return;
-
-    const int padding = 12;
-    const int labelHeight = 20;
-    const int valueWidth = 80;
-    const int sliderHeight = 32;
-    const int comboHeight = 28;
-    const int sectionSpacing = 14;
-    const int controlSpacing = 6;
-
-    int contentWidth = std::max(width - padding * 2, 120);
-    int y = padding;
-
-    if (state->trackLabel)
+    if (!state) return;
+    auto px = [hwnd](int value) { return lfoPixels(hwnd, value); };
+    int padding = px(16), gap = px(16);
+    int contentWidth = std::max(px(400), width - padding * 2);
+    MoveWindow(state->trackLabel, padding, padding, contentWidth, px(24), TRUE);
+    int top = padding + px(36);
+    int sectionHeight = std::max(px(130), (height - top - padding) / 3);
+    int column = (contentWidth - gap) / 2;
+    for (auto& lfo : state->lfos)
     {
-        MoveWindow(state->trackLabel, padding, y, contentWidth, labelHeight, TRUE);
-        y += labelHeight + sectionSpacing;
-    }
-
-    for (size_t i = 0; i < state->lfos.size(); ++i)
-    {
-        auto& lfo = state->lfos[i];
-        if (lfo.headerLabel)
-        {
-            MoveWindow(lfo.headerLabel, padding, y, contentWidth, labelHeight, TRUE);
-            y += labelHeight + controlSpacing;
-        }
-
-        if (lfo.rateLabel && lfo.rateValueLabel)
-        {
-            MoveWindow(lfo.rateLabel, padding, y, contentWidth - valueWidth, labelHeight, TRUE);
-            MoveWindow(lfo.rateValueLabel, padding + contentWidth - valueWidth, y, valueWidth, labelHeight, TRUE);
-            y += labelHeight + controlSpacing;
-        }
-        if (lfo.rateSlider)
-        {
-            MoveWindow(lfo.rateSlider, padding, y, contentWidth, sliderHeight, TRUE);
-            y += sliderHeight + controlSpacing;
-        }
-
-        if (lfo.shapeLabel && lfo.shapeCombo)
-        {
-            MoveWindow(lfo.shapeLabel, padding, y, contentWidth, labelHeight, TRUE);
-            y += labelHeight + controlSpacing;
-            MoveWindow(lfo.shapeCombo, padding, y, contentWidth, comboHeight, TRUE);
-            y += comboHeight + controlSpacing;
-        }
-
-        if (lfo.deformLabel && lfo.deformValueLabel)
-        {
-            MoveWindow(lfo.deformLabel, padding, y, contentWidth - valueWidth, labelHeight, TRUE);
-            MoveWindow(lfo.deformValueLabel, padding + contentWidth - valueWidth, y, valueWidth, labelHeight, TRUE);
-            y += labelHeight + controlSpacing;
-        }
-        if (lfo.deformSlider)
-        {
-            MoveWindow(lfo.deformSlider, padding, y, contentWidth, sliderHeight, TRUE);
-            y += sliderHeight + sectionSpacing;
-        }
+        MoveWindow(lfo.headerLabel, padding, top, px(70), px(24), TRUE);
+        MoveWindow(lfo.shapeLabel, padding + px(80), top, px(55), px(24), TRUE);
+        // Dropdown height includes room for all four waveform choices.
+        MoveWindow(lfo.shapeCombo, padding + px(140), top, contentWidth - px(140), px(150), TRUE);
+        int y = top + px(38), right = padding + column + gap;
+        MoveWindow(lfo.rateLabel, padding, y, column / 2, px(22), TRUE);
+        MoveWindow(lfo.rateValueLabel, padding + column / 2, y, column - column / 2, px(22), TRUE);
+        MoveWindow(lfo.deformLabel, right, y, column / 2, px(22), TRUE);
+        MoveWindow(lfo.deformValueLabel, right + column / 2, y, column - column / 2, px(22), TRUE);
+        MoveWindow(lfo.rateSlider, padding, y + px(24), column, px(32), TRUE);
+        MoveWindow(lfo.deformSlider, right, y + px(24), column, px(32), TRUE);
+        top += sectionHeight;
     }
 }
 
@@ -490,11 +463,14 @@ void ensureWindowClass()
         }
         case WM_SIZE:
         {
-            if (!state)
-                return 0;
-            int width = LOWORD(lParam);
-            int height = HIWORD(lParam);
-            layoutWindow(hwnd, state, width, height);
+            if (!state) return 0;
+            layoutWindow(hwnd, state, LOWORD(lParam), HIWORD(lParam));
+            return 0;
+        }
+        case WM_GETMINMAXINFO:
+        {
+            auto* limits = reinterpret_cast<MINMAXINFO*>(lParam);
+            limits->ptMinTrackSize = {lfoPixels(hwnd, 480), lfoPixels(hwnd, 500)};
             return 0;
         }
         case WM_LFO_SET_TRACK:
@@ -589,6 +565,7 @@ void ensureWindowClass()
 
 void openLfoWindow(HWND parent, int trackId)
 {
+    if(editingPanelCreated()){revealEditingLfos(trackId);return;}
     if (gLfoWindow && IsWindow(gLfoWindow))
     {
         PostMessageW(gLfoWindow, WM_LFO_SET_TRACK, static_cast<WPARAM>(trackId), 0);
@@ -618,8 +595,8 @@ void openLfoWindow(HWND parent, int trackId)
                                 WS_OVERLAPPEDWINDOW,
                                 x,
                                 y,
-                                kDefaultWindowWidth,
-                                kDefaultWindowHeight,
+                                lfoPixels(parent, kDefaultWindowWidth),
+                                lfoPixels(parent, kDefaultWindowHeight),
                                 parent,
                                 nullptr,
                                 GetModuleHandle(nullptr),

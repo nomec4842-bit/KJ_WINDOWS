@@ -52,6 +52,12 @@ enum class ModMatrixParameter
     DelayMix,
     CompressorThreshold,
     CompressorRatio,
+    SynthOsc1WavetablePosition,
+    SynthOsc1WavetableMix,
+    SynthOsc2WavetablePosition,
+    SynthOsc2WavetableMix,
+    SynthOsc3WavetablePosition,
+    SynthOsc3WavetableMix,
 };
 
 using ModParameterGetter = float (*)(int);
@@ -76,6 +82,7 @@ const ModParameterInfo* modMatrixGetParameterInfo(int index);
 int modMatrixGetParameterCount();
 int modMatrixGetParameterIndex(ModMatrixParameter parameter);
 bool modMatrixParameterSupportsTrackType(const ModParameterInfo& info, TrackType trackType);
+bool modMatrixParameterAvailableForTrack(int index, const Track& track);
 
 float modMatrixClampNormalized(float normalized);
 float modMatrixNormalizedToValue(float normalized, const ModParameterInfo& info);
